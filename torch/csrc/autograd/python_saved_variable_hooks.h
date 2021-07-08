@@ -13,12 +13,13 @@ namespace torch { namespace autograd {
 struct PySavedVariableHooks : public SavedVariableHooks {
     TORCH_API PySavedVariableHooks(py::function &pack_hook, py::function &unpack_hook) : pack_hook_(pack_hook), unpack_hook_(unpack_hook){}
 
-    TORCH_API PyObject* call_pack_hook(at::Tensor &tensor) override {
-      return pack_hook_(py::reinterpret_steal<py::object>(THPVariable_Wrap(tensor))).release().ptr();
+    TORCH_API void call_pack_hook(at::Tensor &tensor) override {
+      data_ = pack_hook_(py::reinterpret_steal<py::object>(THPVariable_Wrap(tensor))).release().ptr();
     }
 
-    TORCH_API at::Tensor call_unpack_hook(PyObject* obj) override {
-      return THPVariable_Unpack(unpack_hook_(py::cast<py::object>(obj)).release().ptr());
+    TORCH_API at::Tensor call_unpack_hook() override {
+      py::gil_scoped_acquire acquire;
+      return THPVariable_Unpack(unpack_hook_(py::cast<py::object>(data_)).release().ptr());
     }
 
     TORCH_API ~PySavedVariableHooks() override = default;
@@ -26,6 +27,7 @@ struct PySavedVariableHooks : public SavedVariableHooks {
   private:
     py::function pack_hook_;
     py::function unpack_hook_;
+    PyObject* data_ = nullptr;
 };
 
 }}
