@@ -1127,10 +1127,11 @@ void AliasDb::makePointerTo(const Value* from, const Value* to) {
     return;
   }
 
-  // the contained types of immutable type containers (optional, tuple, future)
-  // are unified, so these types can be mutable or immutable
-  // and point to a type which is mutable or immutable.
-  // Any is mutable but can point to an immutable type through refinement
+  // The contained types of immutable type containers (`Optional`,
+  // `Tuple`, `Future`, and `Union`) are unified, so these types can be
+  // mutable or immutable and point to a type which is mutable or
+  // immutable. `Any` is mutable but can point to an immutable type
+  // through refinement
   if (isMutableTypeInternal(from) != isMutableTypeInternal(to)) {
     bool expected_kind = false;
     for (auto kind : {from->type()->kind(), to->type()->kind()}) {
@@ -1152,26 +1153,26 @@ void AliasDb::makePointerTo(const Value* from, const Value* to) {
     return;
   }
 
-  // At this point, we are dealing with two mutable types.
-  auto fromEl = getOrCreateElement(from);
-  auto toEl = getOrCreateElement(to);
+  // At this point, we are dealing with two mutable types
+  auto from_el = getOrCreateElement(from);
+  auto to_el = getOrCreateElement(to);
 
-  memoryDAGBuilder_->makePointerTo(fromEl, toEl);
+  memoryDAGBuilder_->makePointerTo(from_el, to_el);
 }
 
 void AliasDb::addToContainedElements(
-    const Value* elem,
+    const Value* inner,
     const Value* container) {
-  if (!isMutableTypeInternal(elem)) {
+  if (!isMutableTypeInternal(inner)) {
     return;
   }
 
   TORCH_INTERNAL_ASSERT(isContainerType(container->type()));
 
-  auto elemEl = getOrCreateElement(elem);
-  auto contEl = getOrCreateElement(container);
+  auto inner_el = getOrCreateElement(inner);
+  auto cont_el = getOrCreateElement(container);
 
-  memoryDAGBuilder_->addToContainedElements(elemEl, contEl);
+  memoryDAGBuilder_->addToContainedElements(inner_el, cont_el);
 }
 
 bool AliasDb::mayAlias(const Value* a, const Value* b) const {
@@ -1770,8 +1771,8 @@ c10::optional<Element*> AliasDb::setWildcard(const Value* v) {
   if (!maybe_wildcardElement) {
     return c10::nullopt;
   }
-  // Ensure that we create a corresponding element for `v` still, as it is an
-  // invariant that all mutable values have an element.
+  // Ensure that we create a corresponding Element for `v` still, as it is an
+  // invariant that all mutable values have an Element
   getOrCreateElement(v);
   wildcards_.insert(v);
   return *maybe_wildcardElement;

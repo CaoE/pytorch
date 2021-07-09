@@ -36,6 +36,12 @@ using AliasTypeSet = std::vector<TypePtr>;
  * Values that contain other mutable types, such as List[Tensor], are
  * initialized as containing the Wildcard set for all contained mutable types.
  *
+ * The AliasDb API references the idea of "mutable" vs "immutable"
+ * types. "Mutable" means that the object's value can change, while
+ * "immutable" means that the value is fixed. (For example, `List` is
+ * mutable, so you can add and delete elements from it. On the other
+ * hand, you can't modify a Tuple once you create it, making `Tuple` an
+ * immutable container.)
  */
 class AliasDb {
  public:
