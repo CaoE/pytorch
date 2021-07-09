@@ -551,7 +551,7 @@ class TypeCheckerTest(unittest.TestCase):
                 assert isinstance(n.type, TensorType)
                 assert torch.Size(n.type.__args__) == B.forward(torch.rand(2, 2, 4, 5)).size()
 
-    def test_type_check_conv2D_and_maxpool2d(self):
+    def test_type_check_conv2D_maxpool2d_flatten(self):
 
         class BasicBlock(torch.nn.Module):
             def __init__(self):
@@ -570,6 +570,7 @@ class TypeCheckerTest(unittest.TestCase):
                 out = self.pool(out)
                 out = self.fc1(out)
                 out = self.pool2(out)
+                out = torch.flatten(out, 1)
                 return out
 
         B = BasicBlock()
@@ -582,12 +583,39 @@ class TypeCheckerTest(unittest.TestCase):
         expected_ph_types = [TensorType((4, 3, 32, 32)), TensorType((4, 6, 28, 28)),
                              TensorType((4, 6, 14, 14)), TensorType((4, 16, 10, 10)),
                              TensorType((4, 16, 5, 5)), TensorType((4, 16, 5, 120)),
-                             TensorType((4, 16, 6, 7)), TensorType((4, 16, 6, 7))]
+                             TensorType((4, 16, 6, 7)), TensorType((4, 672)), TensorType((4, 672))]
 
         expected_iter = iter(expected_ph_types)
 
         for n in traced.graph.nodes:
             assert n.type == next(expected_iter)
+
+    def test_type_check_flatten(self):
+        class M(torch.nn.Module):
+            def forward(self, x: TensorType((1, 2, 3, 5, Dyn))):
+                return torch.flatten(x, 1, 2)
+
+        module = M()
+        symbolic_traced: torch.fx.GraphModule = symbolic_trace(module)
+        tc = GraphTypeChecker({}, symbolic_traced)
+        tc.type_check()
+        for n in symbolic_traced.graph.nodes:
+            if n.op == 'output':
+                assert n.type == TensorType((1, 6, 5, Dyn))
+
+
+    def test_type_check_flatten_2(self):
+        class M(torch.nn.Module):
+            def forward(self, x: TensorType((1, Dyn, 3, 5, Dyn))):
+                return torch.flatten(x, 1, 2)
+
+        module = M()
+        symbolic_traced: torch.fx.GraphModule = symbolic_trace(module)
+        tc = GraphTypeChecker({}, symbolic_traced)
+        tc.type_check()
+        for n in symbolic_traced.graph.nodes:
+            if n.op == 'output':
+                assert n.type == TensorType((1, Dyn, 5, Dyn))
 
 
 
@@ -700,6 +728,50 @@ class TypeCheckerTest(unittest.TestCase):
                     assert is_consistent(n.type, TensorType(b.size()))
 
 
+    def test_flatten_fully_static(self):
+        annotation_list = [Dyn, TensorType((2, 5, 6, 9)), TensorType((10, 15, 13, 14)),
+                           TensorType((10, Dyn, 13, 14)), TensorType((Dyn, Dyn, Dyn, 10))]
+        input_list = [(1, 2, 3, 5), (2, 5, 6, 9), (10, 15, 13, 14),
+                      (10, 15, 13, 14), (2, 2, 10, 10)]
+
+        intermediate_list = [Dyn, (2, 5, 6, 9), (10, 15, 13, 14),
+                             (10, 15, 13, 14), (2, 2, 10, 10)]
+
+        start_dim = [1, 2, 1, 2, 0]
+        end_dim = [1, 3, 3, 3, -2]
+
+        for i in range(5):
+            annotation = annotation_list[i]
+            input = input_list[i]
+            # intermediate_type = intermediate_list[i]
+
+            class BasicBlock(torch.nn.Module):
+                def __init__(self, start, end):
+                    super(BasicBlock, self).__init__()
+                    self.start = start
+                    self.end = end
+
+                def forward(self, x):
+                    out = torch.flatten(x, self.start, self.end)
+                    return out
+
+            B = BasicBlock(start_dim[i], end_dim[i])
+            ast_rewriter = RewritingTracer()
+            graph = ast_rewriter.trace(B)
+            traced = GraphModule(ast_rewriter.root, graph, "gm")
+
+            # annotate our argument
+            for n in graph.nodes:
+                if n.op == 'placeholder':
+                    n.type = annotation
+
+            b = B.forward(torch.rand(input))
+            tc = GraphTypeChecker({}, traced)
+            tc.type_check()
+
+            for n in graph.nodes:
+                if n.op == 'output':
+                    assert is_consistent(n.type, TensorType(b.size()))
 
 if __name__ == '__main__':
     unittest.main()
