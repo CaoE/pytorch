@@ -3655,10 +3655,6 @@ def foo(x):
                 return a + 2
             torch.jit.script(invalid4)
 
-    def test_is_optional(self):
-        ann = Union[List[int], List[float]]
-        torch._jit_internal.is_optional(ann)
-
     def test_interpreter_fuzz(self):
         import builtins
         # This test generates random tree-like programs to fuzz test

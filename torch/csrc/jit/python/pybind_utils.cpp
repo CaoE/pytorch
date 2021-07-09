@@ -179,15 +179,6 @@ IValue toIValue(py::handle obj, const TypePtr& type, c10::optional<int32_t> N) {
           dict_type->getKeyType(),
           dict_type->getValueType());
     }
-    case TypeKind::OptionalType: {
-      // check if it's a none obj since optional accepts NoneType
-      if (obj.is_none()) {
-        // check if it's a none obj since optional accepts NoneType
-        // return an IValue() to denote a NoneType
-        return {};
-      }
-      return toIValue(obj, type->expectRef<OptionalType>().getElementType());
-    }
     case TypeKind::ClassType: {
       auto classType = type->expect<ClassType>();
       auto object = py::cast<py::object>(obj);
