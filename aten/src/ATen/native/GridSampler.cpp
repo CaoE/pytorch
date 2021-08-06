@@ -384,13 +384,13 @@ namespace {
 
 }  // namespace
 
-Tensor _grid_sampler_2d_cpu_fallback(const Tensor& input, const Tensor& grid,
+template<typename scalar_t>
+Tensor _grid_sampler_2d_cpu_fallback_kernel(const Tensor& input, const Tensor& grid,
                                      int64_t interpolation_mode_,
                                      int64_t padding_mode_,
-                                     bool align_corners) {
+                                     bool align_corners){
   auto interpolation_mode = static_cast<GridSamplerInterpolation>(interpolation_mode_);
   auto padding_mode = static_cast<GridSamplerPadding>(padding_mode_);
-  using scalar_t = float;
 
   int64_t N = input.size(0);
   int64_t C = input.size(1);
@@ -530,15 +530,29 @@ Tensor _grid_sampler_2d_cpu_fallback(const Tensor& input, const Tensor& grid,
   return output;
 }
 
+Tensor _grid_sampler_2d_cpu_fallback(const Tensor& input, const Tensor& grid,
+                                     int64_t interpolation_mode_,
+                                     int64_t padding_mode_,
+                                     bool align_corners) {
+  if (input.scalar_type() == kFloat)
+    return _grid_sampler_2d_cpu_fallback_kernel<float>(input, grid, interpolation_mode_, padding_mode_, align_corners);
+  else {
+    TORCH_CHECK(input.scalar_type() == kBFloat16,
+                "grid_sampler_2d_cpu not implemented for ", input.scalar_type());
+    return _grid_sampler_2d_cpu_fallback_kernel<BFloat16>(input, grid, interpolation_mode_, padding_mode_, align_corners);
+  }
+}
+
+
+template<typename scalar_t>
 std::tuple<Tensor, Tensor>
-_grid_sampler_2d_cpu_fallback_backward(const Tensor& grad_output,
+_grid_sampler_2d_cpu_fallback_backward_kernel(const Tensor& grad_output,
                                        const Tensor& input, const Tensor& grid,
                                        int64_t interpolation_mode_,
                                        int64_t padding_mode_,
                                        bool align_corners) {
   const auto interpolation_mode = static_cast<GridSamplerInterpolation>(interpolation_mode_);
   const auto padding_mode = static_cast<GridSamplerPadding>(padding_mode_);
-  using scalar_t = float;
 
   auto grad_input = at::zeros_like(input, LEGACY_CONTIGUOUS_MEMORY_FORMAT);
   auto grad_grid = at::empty_like(grid, LEGACY_CONTIGUOUS_MEMORY_FORMAT);
@@ -729,6 +743,21 @@ _grid_sampler_2d_cpu_fallback_backward(const Tensor& grad_output,
   return std::make_tuple(grad_input, grad_grid);
 }
 
+std::tuple<Tensor, Tensor>
+_grid_sampler_2d_cpu_fallback_backward(const Tensor& grad_output,
+                                       const Tensor& input, const Tensor& grid,
+                                       int64_t interpolation_mode_,
+                                       int64_t padding_mode_,
+                                       bool align_corners) {
+  if (input.scalar_type() == kFloat)
+    return _grid_sampler_2d_cpu_fallback_backward_kernel<float>(grad_output, input, grid, interpolation_mode_, padding_mode_, align_corners);
+  else {
+    TORCH_CHECK(input.scalar_type() == kBFloat16,
+                "grid_sampler_2d_cpu not implemented for ", input.scalar_type());
+    return _grid_sampler_2d_cpu_fallback_backward_kernel<BFloat16>(grad_output, input, grid, interpolation_mode_, padding_mode_, align_corners);
+  }
+}
+
 // No shape checking needed here. See # NOTE [ grid_sampler Native Functions ].
 Tensor grid_sampler_2d_cpu(const Tensor& input, const Tensor& grid,
                            int64_t interpolation_mode, int64_t padding_mode,
@@ -737,20 +766,29 @@ Tensor grid_sampler_2d_cpu(const Tensor& input, const Tensor& grid,
   // AVX gather instructions use signed 32-bit offsets to gather float values.
   // Check for possible overflow and fallback to scalar implementation
   if (input.scalar_type() != kDouble) {
-    TORCH_CHECK(input.scalar_type() == kFloat,
-                "grid_sampler_2d_cpu not implemented for ", input.scalar_type());
     auto sizes = input.sizes();
     auto strides = input.strides();
     const auto grid_sW = grid.strides()[2];
     // NOTE: Gather offsets are only used for the input H, W dimensions
     //       or only for strided access to the grid tensor
-    auto max_gather_offset = std::max(
+    if (input.scalar_type() == kFloat){
+      auto max_gather_offset = std::max(
       (sizes[2] - 1) * strides[2] + (sizes[3] - 1) * strides[3],
       grid_sW * (vec::Vectorized<float>::size() - 1));
-
-    if (max_gather_offset > std::numeric_limits<int32_t>::max()) {
+      if (max_gather_offset > std::numeric_limits<int32_t>::max()) {
       return native::_grid_sampler_2d_cpu_fallback(
         input, grid, interpolation_mode, padding_mode, align_corners);
+      }
+    } else {
+      TORCH_CHECK(input.scalar_type() == kBFloat16,
+                "grid_sampler_2d_cpu not implemented for ", input.scalar_type());
+      auto max_gather_offset = std::max(
+      (sizes[2] - 1) * strides[2] + (sizes[3] - 1) * strides[3],
+      grid_sW * (vec::Vectorized<BFloat16>::size() - 1));
+      if (max_gather_offset > std::numeric_limits<int16_t>::max()) {
+      return native::_grid_sampler_2d_cpu_fallback(
+        input, grid, interpolation_mode, padding_mode, align_corners);
+      }
     }
   }
 
@@ -765,7 +803,7 @@ DEFINE_DISPATCH(grid_sampler_2d_cpu_kernel);
 Tensor grid_sampler_3d_cpu(const Tensor& input, const Tensor& grid,
                            int64_t interpolation_mode, int64_t padding_mode,
                            bool align_corners) {
-  return AT_DISPATCH_FLOATING_TYPES(input.scalar_type(), "grid_sampler3d_cpu", [&] {
+  return AT_DISPATCH_FLOATING_TYPES_AND(kBFloat16, input.scalar_type(), "grid_sampler3d_cpu", [&] {
     return grid_sampler_3d_cpu_impl<scalar_t>(
       input, grid, static_cast<GridSamplerInterpolation>(interpolation_mode),
       static_cast<GridSamplerPadding>(padding_mode), align_corners);
@@ -780,7 +818,7 @@ grid_sampler_2d_backward_cpu(const Tensor& grad_output, const Tensor& input, con
   // AVX gather instructions use signed 32-bit offsets to gather float values.
   // Check for possible overflow and fallback to scalar implementation
   if (input.scalar_type() != kDouble) {
-    TORCH_CHECK(input.scalar_type() == kFloat,
+    TORCH_CHECK(input.scalar_type() == kFloat || input.scalar_type() == kBFloat16,
                 "grid_sampler_2d_backward_cpu not implemented for ", input.scalar_type());
     auto isizes = input.sizes();
     auto istrides = input.strides();
@@ -788,15 +826,30 @@ grid_sampler_2d_backward_cpu(const Tensor& grad_output, const Tensor& input, con
     auto gstrides = grad_output.strides();
     const auto grid_sW = grid.strides()[2];
     // NOTE: Gather offsets are only used for the height and width dimensions
-    auto max_gather_offset = std::max(
+    if (input.scalar_type() == kFloat) {
+      auto max_gather_offset = std::max(
       std::max(
         (isizes[2] - 1) * istrides[2] + (isizes[3] - 1) * istrides[3],
         (gsizes[2] - 1) * gstrides[2] + (gsizes[3] - 1) * gstrides[3]),
       grid_sW * (vec::Vectorized<float>::size() - 1));
 
-    if (max_gather_offset > std::numeric_limits<int32_t>::max()) {
-      return native::_grid_sampler_2d_cpu_fallback_backward(
-        grad_output, input, grid, interpolation_mode, padding_mode, align_corners);
+      if (max_gather_offset > std::numeric_limits<int32_t>::max()) {
+        return native::_grid_sampler_2d_cpu_fallback_backward(
+          grad_output, input, grid, interpolation_mode, padding_mode, align_corners);
+      }
+    } else {
+      TORCH_CHECK(input.scalar_type() == kBFloat16,
+            "grid_sampler_2d_backward_cpu not implemented for ", input.scalar_type());
+      auto max_gather_offset = std::max(
+      std::max(
+        (isizes[2] - 1) * istrides[2] + (isizes[3] - 1) * istrides[3],
+        (gsizes[2] - 1) * gstrides[2] + (gsizes[3] - 1) * gstrides[3]),
+      grid_sW * (vec::Vectorized<BFloat16>::size() - 1));
+
+      if (max_gather_offset > std::numeric_limits<int16_t>::max()) {
+        return native::_grid_sampler_2d_cpu_fallback_backward(
+          grad_output, input, grid, interpolation_mode, padding_mode, align_corners);
+      }
     }
   }
 
@@ -810,7 +863,7 @@ DEFINE_DISPATCH(grid_sampler_2d_backward_cpu_kernel);
 std::tuple<Tensor, Tensor>
 grid_sampler_3d_backward_cpu(const Tensor& grad_output, const Tensor& input, const Tensor& grid,
                              int64_t interpolation_mode, int64_t padding_mode, bool align_corners) {
-  return AT_DISPATCH_FLOATING_TYPES(input.scalar_type(), "grid_sampler_3d_backward_cpu", [&] {
+  return AT_DISPATCH_FLOATING_TYPES_AND(kBFloat16, input.scalar_type(), "grid_sampler_3d_backward_cpu", [&] {
     return grid_sampler_3d_backward_cpu_impl<scalar_t>(
       grad_output, input, grid,
       static_cast<GridSamplerInterpolation>(interpolation_mode),
