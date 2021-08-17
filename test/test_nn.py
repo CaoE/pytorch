@@ -16260,6 +16260,7 @@ class TestNNDeviceType(NNTestCase):
                 self.assertTrue(math.isinf(res2.item()))
 
     @onlyOnCPUAndCUDA
+    @dtypesIfCPU(torch.float, torch.double, torch.bfloat16)
     @dtypes(torch.float, torch.double)
     def test_grid_sample_nan_inf(self, device, dtype):
         input = torch.zeros([1, 1, 3, 3], device=device, dtype=dtype)

@@ -477,6 +477,102 @@ struct ApplyGridSample<scalar_t, 2, GridSamplerInterpolation::Bilinear,
     , compute_H(input.size(2))
     , compute_W(input.size(3)) {}
 
+
+// inline std::tuple<
+//     Vec, Vec, Vec, Vec,       // distances to 4 sides
+//     Vec, Vec, Vec, Vec,       // interpolation weights wrt 4 corners
+//     Vec, Vec, Vec, Vec,       // in_bound masks
+//     std::tuple<Vectorized<int32_t>, Vectorized<int32_t>>, std::tuple<Vectorized<int32_t>, Vectorized<int32_t>>                // y_n and x_w
+//   >
+//   compute_interp_params(const Vectorized<BFloat16>& x, const Vectorized<BFloat16>& y) const {
+//     // get NE, NW, SE, SW pixel values from (x, y)
+//     // assuming we get exact integer representation and just use scalar_t
+//     // if we don't, the weights will be garbage anyways.
+//     using iVec = Vectorized<int32_t>;
+//     Vectorized<float> x0, x1, y0, y1;
+//     std::tie(x0, x1) =  convert_bfloat16_float(x);
+//     std::tie(y0, y1) =  convert_bfloat16_float(y);
+//     auto x_w = x0.floor();
+//     auto y_n = y0.floor();
+//     // get distances to each side
+//     auto w0 = x0 - x_w;
+//     auto e0 = Vec(1) - w0;
+//     auto n0 = y0 - y_n;
+//     auto s0 = Vec(1) - n0;
+
+//     // get interpolation weights for each neighbor
+//     // e.g., for the nw corder, the weight is `dist_to_south * dist_to_east`.
+//     auto nw0 = s0 * e0;
+//     auto ne0 = s0 * w0;
+//     auto sw0 = n0 * e0;
+//     auto se0 = n0 * w0;
+
+//     auto i_x_w0 = convert_to_int_of_same_size(x_w);
+//     auto i_y_n0 = convert_to_int_of_same_size(y_n);
+//     auto i_x_e = i_x_w0 + iVec(1);
+//     auto i_y_s = i_y_n0 + iVec(1);
+
+//     // Use int comparison because it is much faster than float comp with AVX2
+//     // (latency 1 cyc vs. 4 cyc on skylake)
+//     // Avoid using the le and ge because those are not implemented in AVX2 and
+//     // are actually simulated using multiple instructions.
+//     auto w_mask = must_in_bound ? iVec(-1)  // true = all ones
+//                                 : (i_x_w0 > iVec(-1)) & (i_x_w0 < iVec(inp_W));
+//     auto n_mask = must_in_bound ? iVec(-1)  // true = all ones
+//                                 : (i_y_n0 > iVec(-1)) & (i_y_n0 < iVec(inp_H));
+//     auto e_mask = must_in_bound ? (i_x_e < iVec(inp_W))
+//                                 : (i_x_e > iVec(-1)) & (i_x_e < iVec(inp_W));
+//     auto s_mask = must_in_bound ? (i_y_s < iVec(inp_H))
+//                                 : (i_y_s > iVec(-1)) & (i_y_s < iVec(inp_H));
+//     auto nw_mask0 = cast<scalar_t>(must_in_bound ? iVec(-1) : (w_mask & n_mask));
+//     auto ne_mask0 = cast<scalar_t>(e_mask & n_mask);
+//     auto sw_mask0 = cast<scalar_t>(w_mask & s_mask);
+//     auto se_mask0 = cast<scalar_t>(e_mask & s_mask);
+
+//     x_w = x1.floor();
+//     y_n = y1.floor();
+//     // get distances to each side
+//     auto w1 = x1 - x_w;
+//     auto e1 = Vec(1) - w1;
+//     auto n1 = y1 - y_n;
+//     auto s1 = Vec(1) - n1;
+
+//     // get interpolation weights for each neighbor
+//     // e.g., for the nw corder, the weight is `dist_to_south * dist_to_east`.
+//     auto nw1 = s1 * e1;
+//     auto ne1 = s1 * w1;
+//     auto sw1 = n1 * e1;
+//     auto se1 = n1 * w1;
+
+//     auto i_x_w1 = convert_to_int_of_same_size(x_w);
+//     auto i_y_n1 = convert_to_int_of_same_size(y_n);
+//     i_x_e = i_x_w1 + iVec(1);
+//     i_y_s = i_y_n1 + iVec(1);
+
+//     // Use int comparison because it is much faster than float comp with AVX2
+//     // (latency 1 cyc vs. 4 cyc on skylake)
+//     // Avoid using the le and ge because those are not implemented in AVX2 and
+//     // are actually simulated using multiple instructions.
+//     w_mask = must_in_bound ? iVec(-1)  // true = all ones
+//                                 : (i_x_w1 > iVec(-1)) & (i_x_w1 < iVec(inp_W));
+//     n_mask = must_in_bound ? iVec(-1)  // true = all ones
+//                                 : (i_y_n1 > iVec(-1)) & (i_y_n1 < iVec(inp_H));
+//     e_mask = must_in_bound ? (i_x_e < iVec(inp_W))
+//                                 : (i_x_e > iVec(-1)) & (i_x_e < iVec(inp_W));
+//     s_mask = must_in_bound ? (i_y_s < iVec(inp_H))
+//                                 : (i_y_s > iVec(-1)) & (i_y_s < iVec(inp_H));
+//     auto nw_mask1 = cast<scalar_t>(must_in_bound ? iVec(-1) : (w_mask & n_mask));
+//     auto ne_mask1 = cast<scalar_t>(e_mask & n_mask);
+//     auto sw_mask1 = cast<scalar_t>(w_mask & s_mask);
+//     auto se_mask1 = cast<scalar_t>(e_mask & s_mask);
+
+//     return std::make_tuple(
+//       convert_float_bfloat16(n0, n1), convert_float_bfloat16(s0, s1), convert_float_bfloat16(w0, w1), convert_float_bfloat16(e0, e1),
+//       convert_float_bfloat16(nw0, nw1), convert_float_bfloat16(ne0, ne1), convert_float_bfloat16(sw0, sw1), convert_float_bfloat16(se0, se1),
+//       convert_float_bfloat16(nw_mask0, nw_mask1), convert_float_bfloat16(ne_mask0, ne_mask1), convert_float_bfloat16(sw_mask0, sw_mask1), convert_float_bfloat16(se_mask0, se_mask1),
+//       std::make_tuple(i_y_n0, i_y_n1), std::make_tuple(i_x_w0, i_x_w1));
+//   }
+
   inline std::tuple<
     Vec, Vec, Vec, Vec,       // distances to 4 sides
     Vec, Vec, Vec, Vec,       // interpolation weights wrt 4 corners
@@ -531,7 +627,59 @@ struct ApplyGridSample<scalar_t, 2, GridSamplerInterpolation::Bilinear,
       nw_mask, ne_mask, sw_mask, se_mask,
       i_y_n, i_x_w);
   }
+  
+  // forward for BFloat16
+  inline void forward(TensorAccessor<BFloat16, 3>& out_slice,
+                      const TensorAccessor<BFloat16, 3>& inp_slice,
+                      int64_t offset, const Vectorized<BFloat16>& grid_x, const Vectorized<BFloat16>& grid_y,
+                      int64_t len) const {
+    // using iVec = Vectorized<int32_t>;
+    // Vectorized<float> grid_x0, grid_x1, grid_y0, grid_y1;
+    // std::tie(grid_x0, grid_x1) =  convert_bfloat16_float(grid_x);
+    // std::tie(grid_y0, grid_y1) =  convert_bfloat16_float(grid_y);
+    auto x = compute_W.apply(grid_x);
+    auto y = compute_H.apply(grid_y);
 
+    auto interp_params = compute_interp_params(x, y);
+
+    auto nw = std::get<4>(interp_params);
+    auto ne = std::get<5>(interp_params);
+    auto sw = std::get<6>(interp_params);
+    auto se = std::get<7>(interp_params);
+
+    auto nw_mask = std::get<8>(interp_params);
+    auto ne_mask = std::get<9>(interp_params);
+    auto sw_mask = std::get<10>(interp_params);
+    auto se_mask = std::get<11>(interp_params);
+
+    auto i_y_n = std::get<12>(interp_params);
+    auto i_x_w = std::get<13>(interp_params);
+
+    auto i_nw_offset = i_y_n * iVec(inp_sH) + i_x_w * iVec(inp_sW);
+    auto i_ne_offset = i_nw_offset + iVec(inp_sW);
+    auto i_sw_offset = i_nw_offset + iVec(inp_sH);
+    auto i_se_offset = i_sw_offset + iVec(inp_sW);
+
+    #if !defined(_MSC_VER) && !defined(COMPILING_FOR_MIN_SIZE)
+    # pragma unroll
+    #endif
+    for (int64_t c = 0; c < C; ++c) {
+      auto inp_slice_C_ptr = inp_slice[c].data();
+
+      // mask_gather zeros out the mask, so we need to make copies
+      Vec nw_mask_copy = nw_mask;
+      Vec ne_mask_copy = ne_mask;
+      Vec sw_mask_copy = sw_mask;
+      Vec se_mask_copy = se_mask;
+      auto nw_val = mask_gather<sizeof(scalar_t)>(Vec(0), inp_slice_C_ptr, i_nw_offset, nw_mask_copy);
+      auto ne_val = mask_gather<sizeof(scalar_t)>(Vec(0), inp_slice_C_ptr, i_ne_offset, ne_mask_copy);
+      auto sw_val = mask_gather<sizeof(scalar_t)>(Vec(0), inp_slice_C_ptr, i_sw_offset, sw_mask_copy);
+      auto se_val = mask_gather<sizeof(scalar_t)>(Vec(0), inp_slice_C_ptr, i_se_offset, se_mask_copy);
+
+      auto interpolated = (nw_val * nw) + (ne_val * ne) + (sw_val * sw) + (se_val * se);
+      interpolated.store(out_slice[c].data() + offset, len);
+    }
+  }
   inline void forward(TensorAccessor<scalar_t, 3>& out_slice,
                       const TensorAccessor<scalar_t, 3>& inp_slice,
                       int64_t offset, const Vec& grid_x, const Vec& grid_y,

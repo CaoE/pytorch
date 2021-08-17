@@ -534,13 +534,10 @@ Tensor _grid_sampler_2d_cpu_fallback(const Tensor& input, const Tensor& grid,
                                      int64_t interpolation_mode_,
                                      int64_t padding_mode_,
                                      bool align_corners) {
-  if (input.scalar_type() == kFloat)
-    return _grid_sampler_2d_cpu_fallback_kernel<float>(input, grid, interpolation_mode_, padding_mode_, align_corners);
-  else {
-    TORCH_CHECK(input.scalar_type() == kBFloat16,
-                "grid_sampler_2d_cpu not implemented for ", input.scalar_type());
-    return _grid_sampler_2d_cpu_fallback_kernel<BFloat16>(input, grid, interpolation_mode_, padding_mode_, align_corners);
-  }
+  return AT_DISPATCH_FLOATING_TYPES_AND(kBFloat16, input.scalar_type(), "grid_sampler_2d_cpu", [&] {
+    return _grid_sampler_2d_cpu_fallback_kernel<scalar_t>(
+      input, grid, interpolation_mode_, padding_mode_, align_corners);
+  });
 }
 
 
@@ -749,13 +746,10 @@ _grid_sampler_2d_cpu_fallback_backward(const Tensor& grad_output,
                                        int64_t interpolation_mode_,
                                        int64_t padding_mode_,
                                        bool align_corners) {
-  if (input.scalar_type() == kFloat)
-    return _grid_sampler_2d_cpu_fallback_backward_kernel<float>(grad_output, input, grid, interpolation_mode_, padding_mode_, align_corners);
-  else {
-    TORCH_CHECK(input.scalar_type() == kBFloat16,
-                "grid_sampler_2d_cpu not implemented for ", input.scalar_type());
-    return _grid_sampler_2d_cpu_fallback_backward_kernel<BFloat16>(grad_output, input, grid, interpolation_mode_, padding_mode_, align_corners);
-  }
+  return AT_DISPATCH_FLOATING_TYPES_AND(kBFloat16, input.scalar_type(), "grid_sampler_2d_backward_cpu", [&] {
+    return _grid_sampler_2d_cpu_fallback_backward_kernel<scalar_t>(
+      grad_output, input, grid, interpolation_mode_, padding_mode_, align_corners);
+  });
 }
 
 // No shape checking needed here. See # NOTE [ grid_sampler Native Functions ].
