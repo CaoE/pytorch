@@ -99,8 +99,14 @@ ideep::tensor itensor_view_from_dense(const Tensor& tensor) {
             tensor.strides().vec()},
             tensor.template data_ptr<BFloat16>()};
   }
+  else if (tensor.scalar_type() == ScalarType::Half) {
+    return {{tensor.sizes().vec(),
+            ideep::tensor::data_type::f16,
+            tensor.strides().vec()},
+            tensor.template data_ptr<Half>()};
+  }
   else {
-    TORCH_CHECK(false, "itensor_view_from_dense expects float/bfloat16 tensor input");
+    TORCH_CHECK(false, "itensor_view_from_dense expects float/bfloat16/half tensor input");
   }
 }
 
