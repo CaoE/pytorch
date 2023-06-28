@@ -10,6 +10,10 @@
 
 #include <climits>
 
+#if AT_MKL_ENABLED()
+#include <mkl.h>
+#endif
+
 #if AT_BUILD_WITH_BLAS()
 #if C10_IOS
 #include <Accelerate/Accelerate.h>
@@ -100,8 +104,8 @@ fbgemm::matrix_op_t to_fbgemm(TransposeType trans) {
 }
 #endif  // USE_FBGEMM
 
-#if (AT_BUILD_WITH_BLAS() && C10_IOS)
-CBLAS_TRANSPOSE to_apple_accelerate_transpose(TransposeType trans) {
+#if (AT_BUILD_WITH_BLAS() && C10_IOS) || AT_MKL_ENABLED()
+CBLAS_TRANSPOSE to_apple_mkl_accelerate_transpose(TransposeType trans) {
   switch (trans) {
     case TransposeType::Transpose: return CblasTrans;
     case TransposeType::NoTranspose: return CblasNoTrans;
@@ -129,8 +133,8 @@ void gemm(
     int m_ = m, n_ = n, k_ = k, lda_ = lda, ldb_ = ldb, ldc_ = ldc;
     double alpha_ = alpha, beta_ = beta;
     #if C10_IOS
-    CBLAS_TRANSPOSE transa_ = to_apple_accelerate_transpose(transa);
-    CBLAS_TRANSPOSE transb_ = to_apple_accelerate_transpose(transb);
+    CBLAS_TRANSPOSE transa_ = to_apple_mkl_accelerate_transpose(transa);
+    CBLAS_TRANSPOSE transb_ = to_apple_mkl_accelerate_transpose(transb);
     cblas_dgemm(CblasColMajor,
       transa_, transb_,
       m_, n_, k_,
@@ -172,8 +176,8 @@ void gemm(
     int m_ = m, n_ = n, k_ = k, lda_ = lda, ldb_ = ldb, ldc_ = ldc;
     float alpha_ = alpha, beta_ = beta;
     #if C10_IOS
-    CBLAS_TRANSPOSE transa_ = to_apple_accelerate_transpose(transa);
-    CBLAS_TRANSPOSE transb_ = to_apple_accelerate_transpose(transb);
+    CBLAS_TRANSPOSE transa_ = to_apple_mkl_accelerate_transpose(transa);
+    CBLAS_TRANSPOSE transb_ = to_apple_mkl_accelerate_transpose(transb);
     cblas_sgemm(CblasColMajor,
       transa_, transb_,
       m_, n_, k_,
@@ -215,8 +219,8 @@ void gemm(
     int m_ = m, n_ = n, k_ = k, lda_ = lda, ldb_ = ldb, ldc_ = ldc;
     c10::complex<double> alpha_ = alpha, beta_ = beta;
     #if C10_IOS
-    CBLAS_TRANSPOSE transa_ = to_apple_accelerate_transpose(transa);
-    CBLAS_TRANSPOSE transb_ = to_apple_accelerate_transpose(transb);
+    CBLAS_TRANSPOSE transa_ = to_apple_mkl_accelerate_transpose(transa);
+    CBLAS_TRANSPOSE transb_ = to_apple_mkl_accelerate_transpose(transb);
     cblas_zgemm(CblasColMajor,
       transa_, transb_,
       m_, n_, k_,
@@ -258,8 +262,8 @@ void gemm(
     int m_ = m, n_ = n, k_ = k, lda_ = lda, ldb_ = ldb, ldc_ = ldc;
     c10::complex<float> alpha_ = alpha, beta_ = beta;
     #if C10_IOS
-    CBLAS_TRANSPOSE transa_ = to_apple_accelerate_transpose(transa);
-    CBLAS_TRANSPOSE transb_ = to_apple_accelerate_transpose(transb);
+    CBLAS_TRANSPOSE transa_ = to_apple_mkl_accelerate_transpose(transa);
+    CBLAS_TRANSPOSE transb_ = to_apple_mkl_accelerate_transpose(transb);
     cblas_cgemm(CblasColMajor,
       transa_, transb_,
       m_, n_, k_,
@@ -336,6 +340,23 @@ void gemm(
    const float beta,
    at::Half *c, int64_t ldc) {
    internal::normalize_last_dims(transa, transb, m, n, k, &lda, &ldb, &ldc);
+#if AT_MKL_ENABLED()
+   if (use_blas_gemm(transa, transb, m, n, k, lda, ldb, ldc)) {
+    int m_ = m, n_ = n, k_ = k, lda_ = lda, ldb_ = ldb, ldc_ = ldc;
+    MKL_F16 alpha_ = Half(alpha).x, beta_ = Half(beta).x;
+    CBLAS_TRANSPOSE transa_ = to_apple_mkl_accelerate_transpose(transa);
+    CBLAS_TRANSPOSE transb_ = to_apple_mkl_accelerate_transpose(transb);
+    cblas_hgemm(CblasColMajor,
+      transa_, transb_,
+      m_, n_, k_,
+      alpha_,
+      reinterpret_cast<const MKL_F16*>(a), lda_,
+      reinterpret_cast<const MKL_F16*>(b), ldb_,
+      beta_,
+      reinterpret_cast<MKL_F16*>(c), ldc_);
+    return;
+   }
+#endif
 #if AT_MKLDNN_ENABLED()
    if (mkldnn_fp16_gemm(transa, transb, m, n, k, alpha, a, lda, b, ldb, beta, c, ldc)) {
      return;

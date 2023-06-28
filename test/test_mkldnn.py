@@ -1520,14 +1520,19 @@ class TestMkldnn(TestCase):
         }
         for dtype in [torch.bfloat16, torch.float16]:
             if support_check[dtype]():
-                a1 = torch.randn([64, 1, 33], dtype=dtype)
-                # a2 is contiguous tensor but it's strides is not default contiguous strides.
-                a2 = torch.as_strided(a1.clone(), [64, 1, 33], [33, 3, 1])
-                self.assertTrue(a2.is_contiguous())
-                b = torch.randn(64, 33, 256).to(dtype=dtype)
-                y1 = torch.ops.aten.bmm(a1, b)
-                y2 = torch.bmm(a2, b)
-                self.assertEqual(y1, y2)
+                with torch.backends.mkldnn.flags(enabled=False):
+                    a1 = torch.randn([64, 1, 33], dtype=dtype)
+                    # a2 is contiguous tensor but it's strides is not default contiguous strides.
+                    a2 = torch.as_strided(a1.clone(), [64, 1, 33], [33, 3, 1])
+                    self.assertTrue(a2.is_contiguous())
+                    b = torch.randn(64, 33, 256).to(dtype=dtype)
+                    a_ref = a1.float()
+                    b_ref = b.float()
+                    y1 = torch.ops.aten.bmm(a1, b)
+                    y2 = torch.bmm(a2, b)
+                    y_ref = torch.bmm(a_ref, b_ref)
+                    self.assertEqual(y1, y2)
+                    self.assertEqual(y1, y_ref.to(dtype=dtype))
 
 if __name__ == '__main__':
     run_tests()

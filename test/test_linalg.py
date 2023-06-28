@@ -4630,7 +4630,7 @@ class TestLinalg(TestCase):
                   torch.half,
                   *[torch.bfloat16] if SM53OrLater else []
                   ))
-    @dtypes(*all_types_and_complex_and(torch.bfloat16))
+    @dtypes(*all_types_and_complex_and(torch.bfloat16, torch.half))
     def test_corner_cases_of_cublasltmatmul(self, device, dtype):
         # common case
         M = torch.randn(128, device=device).to(dtype)
