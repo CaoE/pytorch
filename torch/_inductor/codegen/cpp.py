@@ -1572,6 +1572,7 @@ class CppKernel(Kernel):
         self.is_reduction = False
         self.non_parallel_reduction_prefix = IndentedBuffer()
         self.reduction_cse = CSE(self.newvar_prefix, self.suffix, name_prefix="tmp_acc")
+        self.weight_recps_cse = CSE(self.newvar_prefix, self.suffix, name_prefix="wrecps")
         self.preloads = IndentedBuffer()
         self.poststores = IndentedBuffer()
         self.num_threads = num_threads  # num_threads the kernel specialized for
@@ -1625,8 +1626,8 @@ class CppKernel(Kernel):
         if (
             reduction_type == "welford_reduce"
             and welford_weight_reciprocal_vec_fn
-            and hasattr(self, "reduction_main_size")
             and "vec" in f"{acc_type}"
+            and self.gen_weight_recps
         ):
             self.local_reduction_init.writeline(
                 welford_weight_reciprocal_vec_fn(dtype, num_threads)
@@ -2381,7 +2382,10 @@ class CppVecKernel(CppKernel):
         stride = self._try_get_const_stride(index, tiling_var)
         code = IndentedBuffer()
         if stride == 1:
-            code.writeline(f"{value}.store({var_expr}, {self.num_elems});")
+            if dtype == torch.float and self.tail_size == None:
+                code.writeline(f"{value}.store({var_expr});")
+            else:
+                code.writeline(f"{value}.store({var_expr}, {self.num_elems});")
         else:
             self._load_or_store_non_contiguous(
                 var, index, dtype, buffer=code, store_value=value
@@ -2445,27 +2449,22 @@ class CppVecKernel(CppKernel):
             reduction_size = functools.reduce(
                 lambda x, y: x * y, self.ranges[self.reduction_depth :]
             )
-            if self.tiling_idx >= self.reduction_depth:
-                assert self.tiling_idx == len(self.ranges) - 1
-                # calculate the reduction size that will be vectorized
-                reduction_inner_size = self.ranges[-1]
-                # calculate loops size outside the vectorized loop
-                self.reduction_outer_size = reduction_size // reduction_inner_size
-                # calculate the main loop size
-                self.reduction_main_size = (
-                    FloorDiv(reduction_inner_size, self.tiling_factor)
-                    * self.tiling_factor
+            reduction_factor = (
+                self.tiling_factor if self.tiling_idx >= self.reduction_depth else 1
+            )
+            self.weight_recp_vec_range = CeilDiv(reduction_size, reduction_factor)
+            if self.weight_recp_vec_range not in self.weight_recps_cse.reduction_cache:
+                self.gen_weight_recps = True
+                self.weight_recps_val = self.weight_recps_cse.generate(
+                    self.compute, f"reduction {self.weight_recp_vec_range}", write=False
                 )
-                # calculate the tail loop size
-                self.reduction_tail_size = (
-                    reduction_inner_size - self.reduction_main_size
+                self.weight_recps_cse.reduction_cache[self.weight_recp_vec_range] = self.weight_recps_val
+                self.non_parallel_reduction_prefix.writeline(
+                    self.welford_weight_reciprocal_vec(dtype)
                 )
             else:
-                self.reduction_main_size = reduction_size
-
-            self.non_parallel_reduction_prefix.writeline(
-                self.welford_weight_reciprocal_vec(dtype, None)
-            )
+                self.gen_weight_recps = False
+                self.weight_recps_val = self.weight_recps_cse.reduction_cache[self.weight_recp_vec_range]
             self.stores.writeline(
                 f"{acc_vec} = {self.reduction_combine_vec(reduction_type, acc_vec, value, True)};"
             )
@@ -2589,32 +2588,18 @@ class CppVecKernel(CppKernel):
         return vec_type
 
     def welford_weight_reciprocal_vec(self, dtype, num_threads=None):
-        if self.tiling_idx >= self.reduction_depth:
-            reduction_main_size_thread = (
-                CeilDiv(self.reduction_main_size / self.tiling_factor, num_threads)
-                * self.tiling_factor
-                if num_threads
-                else self.reduction_main_size
-            )
-            reduction_main_size_thread_expr = cexpr_index(reduction_main_size_thread)
-            reduction_outer_size_expr = cexpr_index(self.reduction_outer_size)
-            reduction_tail_size_expr = cexpr_index(self.reduction_tail_size)
-            return (
-                f"static WeightRecp<{self._get_vec_type(dtype)}> weight_recps"
-                f"("
-                f"{reduction_outer_size_expr}, "
-                f"{reduction_main_size_thread_expr}, "
-                f"{reduction_tail_size_expr}"
-                f");"
-            )
-        else:
-            reduction_main_size_thread_expr = cexpr_index(self.reduction_main_size)
-            return (
-                f"static WeightRecp<{self._get_vec_type(dtype)}> weight_recps"
-                f"("
-                f"{reduction_main_size_thread_expr}"
-                f");"
-            )
+        vec_num_range_thread = (
+            CeilDiv(self.weight_recp_vec_range, num_threads)
+            if num_threads
+            else self.weight_recp_vec_range
+        )
+        vec_num_range_thread_expr = cexpr_index(vec_num_range_thread)
+        return (
+            f"static WeightRecp<{self._get_vec_type(dtype)}> {self.weight_recps_val}"
+            f"("
+            f"{vec_num_range_thread_expr}"
+            f");"
+        )
 
     def reduction_combine_vec(
         self, reduction_type, var, next_value, use_weight_recps=False
@@ -2647,9 +2632,9 @@ class CppVecKernel(CppKernel):
         elif reduction_type == "welford_reduce":
             if use_weight_recps:
                 if self.tail_size:
-                    return f"welford_combine({var}, {next_value}, {self.tail_size}, &weight_recps)"
+                    return f"welford_combine({var}, {next_value}, {self.tail_size}, &{self.weight_recps_val})"
                 else:
-                    return f"welford_combine({var}, {next_value}, &weight_recps)"
+                    return f"welford_combine({var}, {next_value}, &{self.weight_recps_val})"
             else:
                 if self.tail_size:
                     return f"welford_combine({var}, {next_value}, {self.tail_size})"
@@ -3548,7 +3533,7 @@ class CppKernelProxy(CppKernel):
                 )
                 main_loop.set_kernel(vec_kernel)
                 main_loop.simd_vec = True
-                if could_masked_vec:
+                if could_masked_vec and (tail_loop.size - tail_loop.offset) >= 4:
                     tail_loop.steps = tail_loop.size - tail_loop.offset
                     masked_vec_kernel = codegen_kernel(
                         CppVecKernel,
