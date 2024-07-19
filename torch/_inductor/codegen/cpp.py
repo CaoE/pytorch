@@ -2440,7 +2440,6 @@ class CppVecKernel(CppKernel):
             )
             self.weight_recp_vec_range = FloorDiv(reduction_size, reduction_factor)
             if self.weight_recp_vec_range not in self.weight_recps_cse.reduction_cache:
-                self.gen_weight_recps = True
                 self.weight_recps_val = self.weight_recps_cse.generate(
                     self.compute, f"reduction {self.weight_recp_vec_range}", write=False
                 )
@@ -2458,7 +2457,6 @@ class CppVecKernel(CppKernel):
                     self.welford_weight_reciprocal_vec(dtype, num_threads)
                 )
             else:
-                self.gen_weight_recps = False
                 self.weight_recps_val = self.weight_recps_cse.reduction_cache[
                     self.weight_recp_vec_range
                 ]
