@@ -201,8 +201,10 @@ struct Kernel_Cache {
       const std::function<std::shared_ptr<value_t>()>& callback) {
     auto&& search = get_store().find(key);
     if (search != get_store().end()) {
+      // printf("find kernel\n");
       return std::move(search->second);
     } else {
+      // printf("create kernel\n");
       get_store().insert({key, callback()});
       return std::move(get_store()[key]);
     }
@@ -229,6 +231,7 @@ inline dnnl::memory::data_type get_dnnl_dtype(ScalarType dtype) {
         TORCH_CHECK(false, "get_dnnl_dtype expects float/bfloat16/half/int8 tensor input");
     }
 }
+#endif
 
 struct BrgemmKey {
   int64_t M;
@@ -304,6 +307,7 @@ struct PackKey {
   }
 };
 
+#if AT_MKLDNN_ENABLED()
 struct GemmHelper {
   GemmHelper(
       int64_t M,
@@ -332,8 +336,64 @@ struct GemmHelper {
   std::vector<std::pair<int64_t, int64_t>> A_B_offsets;
 };
 
-template<typename scalar_t_a, typename scalar_t_b, typename scalar_t_c>
 struct Brgemm : public Kernel_Cache<BrgemmKey, GemmHelper> {
+  // create GemmHelper object
+  static inline std::shared_ptr<GemmHelper>&& create(
+      int64_t M,
+      int64_t N,
+      int64_t K,
+      int64_t bs,
+      int64_t ld_a,
+      int64_t ld_b,
+      int64_t ld_c,
+      ScalarType dt_a,
+      ScalarType dt_b,
+      ScalarType dt_c,
+      const float alpha,
+      const float beta) {
+      auto&& key = BrgemmKey(M, N, K, bs, ld_a, ld_b, ld_c, dt_a, dt_b, dt_c, alpha, beta);
+      auto&& value = fetch_or_create(key, [&]() {
+        auto&& v = std::make_shared<GemmHelper>(
+            M, N, K, 1, ld_a, ld_b, ld_c, dt_a, dt_b, dt_c, alpha, beta);
+          (*v).brg.generate();
+          return std::move(v);
+        });
+      return std::move(value);
+  }
+  // execute brgemm with extern offsets
+  static inline void execute(
+    const std::shared_ptr<GemmHelper>& ghelper,
+    const void* A,
+    const void* B,
+    const std::vector<std::pair<int64_t, int64_t>>& offsets,
+    void* C
+  ) {
+    if (get_current() != ghelper) {
+      dnnl::ukernel::brgemm::release_hw_context();
+      ((*ghelper).brg).set_hw_context();
+      get_current() = ghelper;
+    }
+    ((*ghelper).brg).execute(A, B, offsets, C, (*ghelper).scratchpad.data());
+  }
+
+  // execute brgemm with default offsets
+  static inline void execute(
+    const std::shared_ptr<GemmHelper>& ghelper,
+    const void* A,
+    const void* B,
+    void* C
+  ) {
+    if (get_current() != ghelper) {
+      //TODO only call once release_hw_context at end when it is supported
+      dnnl::ukernel::brgemm::release_hw_context();
+      ((*ghelper).brg).set_hw_context();
+      get_current() = ghelper;
+    }
+    ((*ghelper).brg).execute(A, B, (*ghelper).A_B_offsets, C, (*ghelper).scratchpad.data());
+  }
+
+  // fetch/create GemmHelper object and execute brgemm with batch size and extern offset
+  template<typename scalar_t_a, typename scalar_t_b, typename scalar_t_c>
   static inline void call(
       int64_t M,
       int64_t N,
@@ -345,7 +405,7 @@ struct Brgemm : public Kernel_Cache<BrgemmKey, GemmHelper> {
       const float alpha,
       const float beta,
       const scalar_t_a* A,
-      const scalar_t_a* B,
+      const scalar_t_b* B,
       const std::vector<std::pair<int64_t, int64_t>>& offsets,
       scalar_t_c* C) {
     auto&& key = BrgemmKey(M, N, K, bs, ld_a, ld_b, ld_c, c10::CppTypeToScalarType<scalar_t_a>::value, c10::CppTypeToScalarType<scalar_t_b>::value, c10::CppTypeToScalarType<scalar_t_c>::value, alpha, beta);
@@ -355,11 +415,16 @@ struct Brgemm : public Kernel_Cache<BrgemmKey, GemmHelper> {
       (*v).brg.generate();
       return std::move(v);
     });
-    ((*value).brg).set_hw_context();
+    if (get_current() != value) {
+      dnnl::ukernel::brgemm::release_hw_context();
+      ((*value).brg).set_hw_context();
+      get_current() = value;
+    }
     ((*value).brg).execute(A, B, offsets, C, (*value).scratchpad.data());
-    release();
   }
 
+  // fetch/create GemmHelper object and execute brgemm without batch size
+  template<typename scalar_t_a, typename scalar_t_b, typename scalar_t_c>
   static inline void call(
       int64_t M,
       int64_t N,
@@ -380,18 +445,51 @@ struct Brgemm : public Kernel_Cache<BrgemmKey, GemmHelper> {
       (*v).brg.generate();
       return std::move(v);
     });
-    ((*value).brg).set_hw_context();
+    if (get_current() != value) {
+      dnnl::ukernel::brgemm::release_hw_context();
+      ((*value).brg).set_hw_context();
+      get_current() = value;
+    }
     ((*value).brg)
         .execute(A, B, (*value).A_B_offsets, C, (*value).scratchpad.data());
-    release();
   }
-  static inline void release() {
-    dnnl::ukernel::brgemm::release_hw_context();
+
+  static inline std::shared_ptr<GemmHelper>& get_current() {
+    static thread_local std::shared_ptr<GemmHelper> current;
+    return current;
   }
 };
 
-struct Pack : public Kernel_Cache<PackKey, dnnl::ukernel::brgemm_pack_B> {
-  using pack_t = dnnl::ukernel::brgemm_pack_B;
+using pack_t = dnnl::ukernel::brgemm_pack_B;
+struct Pack : public Kernel_Cache<PackKey, pack_t> {
+  static inline std::shared_ptr<pack_t>&& create(
+    int64_t K,
+    int64_t N,
+    int64_t ld_in,
+    int64_t ld_out,
+    ScalarType dt_in,
+    ScalarType dt_out) {
+    auto&& key = PackKey(K, N, ld_in, ld_out, dt_in, dt_out);
+    auto&& pack = fetch_or_create(key, [&]() {
+        auto&& p =
+            std::make_shared<pack_t>(K, N, ld_in, ld_out, get_dnnl_dtype(dt_in), get_dnnl_dtype(dt_out));
+        if ((*p).need_pack()) {
+          (*p).generate();
+        }
+        return std::move(p);
+      });
+    return std::move(pack);
+  }
+  static inline void execute(
+    const std::shared_ptr<pack_t>& pack,
+    const void* in,
+    void* out) {
+    if ((*pack).need_pack()) {
+      (*pack).execute(in, out);
+    } else {
+      TORCH_CHECK(false, "No need to pack");
+    }
+  }
   static inline void call(
       int64_t K,
       int64_t N,
@@ -403,12 +501,12 @@ struct Pack : public Kernel_Cache<PackKey, dnnl::ukernel::brgemm_pack_B> {
       void* out) {
     auto&& key = PackKey(K, N, ld_in, ld_out, dt_in, dt_out);
     auto&& pack = fetch_or_create(key, [&]() {
-      auto&& pack_tmp =
+      auto&& p =
           std::make_shared<pack_t>(K, N, ld_in, ld_out, get_dnnl_dtype(dt_in), get_dnnl_dtype(dt_out));
-      if ((*pack_tmp).need_pack()) {
-        (*pack_tmp).generate();
+      if ((*p).need_pack()) {
+        (*p).generate();
       }
-      return std::move(pack_tmp);
+      return std::move(p);
     });
     if ((*pack).need_pack()) {
       (*pack).execute(in, out);
@@ -421,12 +519,12 @@ struct Pack : public Kernel_Cache<PackKey, dnnl::ukernel::brgemm_pack_B> {
     auto key = PackKey(
         int64_t(64), int64_t(64), int64_t(64), int64_t(64), dt_in, dt_out);
     auto&& pack = fetch_or_create(key, [&]() {
-      auto&& pack_tmp = std::make_shared<pack_t>(
+      auto&& p = std::make_shared<pack_t>(
           int64_t(64), int64_t(64), int64_t(64), int64_t(64), get_dnnl_dtype(dt_in), get_dnnl_dtype(dt_out));
-      if ((*pack_tmp).need_pack()) {
-        (*pack_tmp).generate();
+      if ((*p).need_pack()) {
+        (*p).generate();
       }
-      return std::move(pack_tmp);
+      return std::move(p);
     });
     return (*pack).need_pack();
   }
@@ -454,8 +552,8 @@ void brgemm(
     int64_t ld_c,
     const float alpha,
     const float beta,
-    const at::Half* A,
-    const at::Half* B,
+    const at::BFloat16* A,
+    const at::BFloat16* B,
     const std::vector<std::pair<int64_t, int64_t>>& offsets,
     float* C);
 
@@ -470,10 +568,66 @@ void brgemm(
     int64_t ld_c,
     const float alpha,
     const float beta,
-    const at::Half* A,
-    const at::Half* B,
+    const at::BFloat16* A,
+    const at::BFloat16* B,
     float* C);
 
+#if AT_MKLDNN_ENABLED()
+std::shared_ptr<GemmHelper>&& brgemm_create(
+    int64_t M,
+    int64_t N,
+    int64_t K,
+    int64_t bs,
+    int64_t ld_a,
+    int64_t ld_b,
+    int64_t ld_c,
+    ScalarType dt_a,
+    ScalarType dt_b,
+    ScalarType dt_c,
+    const float alpha,
+    const float beta);
+
+void brgemm_execute(
+  const std::shared_ptr<GemmHelper>& ghelper,
+  const void* A,
+  const void* B,
+  const std::vector<std::pair<int64_t, int64_t>>& offsets,
+  float* C);
+
+void brgemm_execute(
+  const std::shared_ptr<GemmHelper>& ghelper,
+  const void* A,
+  const void* B,
+  float* C);
+#else
+
+std::shared_ptr<BrgemmKey>&& brgemm_create(
+    int64_t M,
+    int64_t N,
+    int64_t K,
+    int64_t bs,
+    int64_t ld_a,
+    int64_t ld_b,
+    int64_t ld_c,
+    const float alpha,
+    const float beta);
+
+void brgemm_execute(
+  const std::shared_ptr<BrgemmKey>& ghelper,
+  const at::BFloat16* A,
+  const at::BFloat16* B,
+  const std::vector<std::pair<int64_t, int64_t>>& offsets,
+  float* C);
+
+void brgemm_execute(
+  const std::shared_ptr<BrgemmKey>& ghelper,
+  const at::BFloat16* A,
+  const at::BFloat16* B,
+  float* C);
+
+#endif
+
+void brgemm_release();
 // Pack B matrix to get better performance if needed
 void pack(
     int64_t K,
@@ -485,6 +639,32 @@ void pack(
     const void* in,
     void* out);
 
+#if AT_MKLDNN_ENABLED()
+  std::shared_ptr<pack_t>&& pack_create(
+    int64_t K,
+    int64_t N,
+    int64_t ld_in,
+    int64_t ld_out,
+    ScalarType dt_in,
+    ScalarType dt_out);
+
+void pack_execute(
+  const std::shared_ptr<pack_t>& pack,
+  const void* in,
+  void* out);
+#else
+std::shared_ptr<PackKey>&& pack_create(
+    int64_t K,
+    int64_t N,
+    int64_t ld_in,
+    int64_t ld_out,
+    ScalarType dt_in,
+    ScalarType dt_out);
+void pack_execute(
+  const std::shared_ptr<PackKye>& pack,
+  const void* in,
+  void* out);
+#endif
 // Whether pack is needed in the platform.
 bool need_pack(ScalarType dt_in, ScalarType dt_out);
 

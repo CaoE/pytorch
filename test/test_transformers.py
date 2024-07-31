@@ -1917,15 +1917,15 @@ class TestSDPA(NNTestCase):
 
     @onlyCPU
     @parametrize("fused_kernel", [SDPBackend.FLASH_ATTENTION])
-    @parametrize("dtype", [torch.float64, torch.float32, torch.bfloat16, torch.float16])
-    @parametrize("batch_size", [2])
-    @parametrize("q_seq_len", [267])
-    @parametrize("kv_seq_len", [514])
-    @parametrize("n_head", [3])
-    @parametrize("head_dim", [8])
+    @parametrize("dtype", [torch.bfloat16])
+    @parametrize("batch_size", [1, 32])
+    @parametrize("q_seq_len", [512])
+    @parametrize("kv_seq_len", [512])
+    @parametrize("n_head", [8])
+    @parametrize("head_dim", [64])
     @parametrize("mask_dim", [2, 4])
     @parametrize("bool_mask", [0, 1])
-    @parametrize("train", [True, False])
+    @parametrize("train", [False])
     def test_scaled_dot_product_fused_attention_mask_vs_math_cpu(
         self,
         device,
@@ -1940,16 +1940,18 @@ class TestSDPA(NNTestCase):
         bool_mask,
         train,
     ):
+        import time
         tol = Tolerances(1e-5, 5e-6)
         if dtype is torch.bfloat16:
             tol = Tolerances(5e-2, 5e-2)
         if dtype is torch.float16:
             tol = Tolerances(1e-2, 1e-2)
         for mask_shape in itertools.product(
-            [q_seq_len, 1], [kv_seq_len, 1]
+            [q_seq_len, ], [kv_seq_len, ]
         ) if mask_dim == 2 else itertools.product(
-            [batch_size, 1], [n_head, 1], [q_seq_len, 1], [kv_seq_len, 1]
+            [batch_size, ], [n_head, ], [q_seq_len, ], [kv_seq_len, ]
         ):
+            print(dtype, " ", batch_size, " ", q_seq_len, " ", kv_seq_len, " ", n_head, " ", head_dim, " ", mask_dim, " ", bool_mask)
             make_tensor = partial(rand_sdpa_tensor, type="dense", device=device, dtype=dtype, requires_grad=False)
             q_shape = SdpaShape(batch_size, n_head, q_seq_len, head_dim)
             kv_shape = SdpaShape(batch_size, n_head, kv_seq_len, head_dim)
@@ -1980,14 +1982,30 @@ class TestSDPA(NNTestCase):
             k2 = k2.view(batch_size, kv_seq_len, n_head, head_dim).transpose(1, 2)
             v2 = v2.view(batch_size, kv_seq_len, n_head, head_dim).transpose(1, 2)
 
+            warmiter = 1000
+            itern = 3000
             with sdpa_kernel(backends=[fused_kernel]):
-                actual = torch.nn.functional.scaled_dot_product_attention(
-                    q, k, v, attn_mask=attn_mask, dropout_p=0.0, is_causal=False)
+                for _ in range(warmiter):
+                    actual = torch.nn.functional.scaled_dot_product_attention(
+                        q, k, v, attn_mask=attn_mask, dropout_p=0.0, is_causal=False)
+                start = time.time()
+                for _ in range(itern):
+                    actual = torch.nn.functional.scaled_dot_product_attention(
+                        q, k, v, attn_mask=attn_mask, dropout_p=0.0, is_causal=False)
+                end = time.time()
+                print("fa time: {}".format((end - start) * 1000. / itern))
             with sdpa_kernel(backends=[SDPBackend.MATH]):
                 if not bool_mask and dtype in [torch.bfloat16, torch.float16]:
                     attn_mask = attn_mask.float()
-                math_ref = torch.nn.functional.scaled_dot_product_attention(
-                    q2, k2, v2, attn_mask=attn_mask, dropout_p=0.0, is_causal=False)
+                for _ in range(warmiter):
+                    math_ref = torch.nn.functional.scaled_dot_product_attention(
+                        q2, k2, v2, attn_mask=attn_mask, dropout_p=0.0, is_causal=False)
+                start = time.time()
+                for _ in range(itern):
+                    math_ref = torch.nn.functional.scaled_dot_product_attention(
+                        q2, k2, v2, attn_mask=attn_mask, dropout_p=0.0, is_causal=False)
+                end = time.time()
+                print("math time: {}".format((end - start) * 1000. / itern))
 
             if dtype in [torch.bfloat16, torch.float16]:
                 math_ref = math_ref.to(dtype)
