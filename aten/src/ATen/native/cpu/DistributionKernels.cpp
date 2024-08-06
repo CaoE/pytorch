@@ -115,14 +115,12 @@ void exponential_kernel(TensorIteratorBase &iter, double lambda, std::optional<G
   Tensor self = iter.tensor(0);
   if (lambda > 0 && !std::isinf(lambda) && !std::isnan(lambda)) {
     CPUGeneratorImpl* generator = get_generator_or_default<CPUGeneratorImpl>(gen, detail::getDefaultCPUGenerator());
-    int64_t seed;
+    uint32_t params[2];
     {
       // See Note [Acquire lock when using random generators]
       std::lock_guard<std::mutex> lock(generator->mutex_);
-      if (self.scalar_type() == at::kDouble)
-        seed = generator->random64();
-      else
-        seed = generator->random();
+      params[0] = generator->random();
+      params[1] = generator->random();
     }
     int64_t n = self.numel();
     bool contig = self.is_contiguous();
@@ -160,13 +158,13 @@ void exponential_kernel(TensorIteratorBase &iter, double lambda, std::optional<G
         if (len > 0) {
           VSLStreamStatePtr stream;
           if constexpr (std::is_same<scalar_t, double>::value) {
-            vslNewStream(&stream, VSL_BRNG_MCG31, seed);
+            vslNewStreamEx(&stream, VSL_BRNG_PHILOX4X32X10, 2, params);
             vslSkipAheadStream(stream, begin);
             vdRngExponential(VSL_RNG_METHOD_EXPONENTIAL_ICDF, stream, len,
               (double *)(sample_ptr + begin), eps, 1./lambda);
             vslDeleteStream(&stream);
           } else {
-            vslNewStream(&stream, VSL_BRNG_MCG31, seed);
+            vslNewStreamEx(&stream, VSL_BRNG_PHILOX4X32X10, 2, params);
             vslSkipAheadStream(stream, begin);
             vsRngExponential(VSL_RNG_METHOD_EXPONENTIAL_ICDF, stream, len,
               (float *) (sample_ptr + begin), eps, 1./lambda);
