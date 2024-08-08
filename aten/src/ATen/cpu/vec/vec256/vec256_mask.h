@@ -31,6 +31,32 @@ struct VecMaskLoad<
   }
 };
 
+template <typename data_t, typename mask_t>
+struct VecMaskLoad<
+    data_t,
+    2,
+    mask_t,
+    1,
+    typename std::enable_if_t<
+        std::is_same_v<data_t, int64_t> ||
+        std::is_same_v<data_t, double>>> {
+  static inline VectorizedN<data_t, 2> apply(
+      const data_t* ptr,
+      const VecMask<mask_t, 1>& vec_mask) {
+    auto int_mask = vec_mask.template cast<int, 1>();
+    auto int64_mask = convert<int64_t, 2, int, 1>(int_mask);
+    at::vec::VectorizedN<data_t, 2> result;
+    if constexpr (std::is_same_v<data_t, int64_t>) {
+      result[0] = _mm256_maskload_epi64(ptr, int64_mask[0]);
+      result[1] = _mm256_maskload_epi64(ptr, int64_mask[1]);
+    } else {
+      result[0] = _mm256_maskload_pd(ptr, int64_mask[0]);
+      result[1] = _mm256_maskload_pd(ptr, int64_mask[1]);
+    }
+    return result;
+  }
+};
+
 // TODO: add specialization of VecMaskLoad for bfloat16/half and int8/uint8
 
 template <>

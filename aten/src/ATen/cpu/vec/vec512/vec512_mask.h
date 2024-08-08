@@ -78,18 +78,30 @@ struct VecMaskLoad<
   }
 };
 
-template <typename mask_t>
-struct VecMaskLoad<int64_t, 2, mask_t, 1> {
-  static inline VectorizedN<int64_t, 2> apply(
-      const int64_t* ptr,
+template <typename data_t, typename mask_t>
+struct VecMaskLoad<
+    data_t,
+    2,
+    mask_t,
+    1,
+    typename std::enable_if_t<
+        std::is_same_v<data_t, int64_t> ||
+        std::is_same_v<data_t, double>>> {
+  static inline VectorizedN<data_t, 2> apply(
+      const data_t* ptr,
       const VecMask<mask_t, 1>& vec_mask) {
     auto all_ones = _mm512_set1_epi32(0xFFFFFFFF);
     auto zero = _mm512_set1_epi64(0);
     auto int_mask = vec_mask.template cast<int, 1>()[0];
     auto mmask = _mm512_cmp_epi32_mask(int_mask, all_ones, _MM_CMPINT_EQ);
-    at::vec::VectorizedN<int64_t, 2> result;
-    result[0] = _mm512_mask_loadu_epi64(zero, (__mmask8)mmask, ptr);
-    result[1] = _mm512_mask_loadu_epi64(zero, (__mmask8)(mmask >> 8), ptr + 8);
+    at::vec::VectorizedN<data_t, 2> result;
+    if constexpr (std::is_same_v<data_t, int64_t>) {
+      result[0] = _mm512_mask_loadu_epi64(zero, (__mmask8)mmask, ptr);
+      result[1] = _mm512_mask_loadu_epi64(zero, (__mmask8)(mmask >> 8), ptr + 8);
+    } else {
+      result[0] = _mm512_mask_loadu_pd(zero, (__mmask8)mmask, ptr);
+      result[1] = _mm512_mask_loadu_pd(zero, (__mmask8)(mmask >> 8), ptr + 8);
+    }
     return result;
   }
 };
