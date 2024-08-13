@@ -3217,6 +3217,31 @@ class TilingSelect:
         tiling_indices = self._select_tiling_indices(
             fn_list, var_sizes_list, tiling_factor
         )
+        
+        group, reduction_group = max(
+            var_sizes_list, key=lambda sizes: len(sizes[1])
+        )
+        call_ranges = tuple(group) + tuple(reduction_group)
+
+
+        
+        if len(tiling_indices) > 2:
+            import pdb
+            pdb.set_trace()
+            print("before tiling_factor: ", tiling_factor)
+            print("tiling_indices: ", tiling_indices)
+            print("var_sizes_list: ", var_sizes_list)
+            print("group: ", group)
+            print("reduction_group: ", reduction_group)
+
+        if dtype in DTYPE_LOWP_FP:
+            assert len(tiling_indices) <= 2
+            for tiling_indice in tiling_indices:
+                if call_ranges[tiling_indice] <= tiling_factor // 2:
+                    tiling_factor = tiling_factor // 2
+                    break
+        # print("after tiling_factor: ", tiling_factor)
+
         if tiling_indices:
             if config.cpp.enable_tiling_heuristics:
 
