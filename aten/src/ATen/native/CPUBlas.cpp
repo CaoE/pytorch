@@ -868,9 +868,81 @@ void brgemm(
   "BFloat16 Brgemm is only supported on X64 when mkldnn is enabled and avx512 is supported");
 }
 
+void brgemm(
+    int64_t M,
+    int64_t N,
+    int64_t K,
+    int64_t ld_a,
+    int64_t ld_b,
+    int64_t ld_c,
+    const float alpha,
+    const float beta,
+    const float* A,
+    const float* B,
+    float* C) {
+  TORCH_CHECK(false,
+  "float Brgemm is currently not supported");
+}
+
+void brgemm(
+    int64_t M,
+    int64_t N,
+    int64_t K,
+    int64_t ld_a,
+    int64_t ld_b,
+    int64_t ld_c,
+    const float alpha,
+    const float beta,
+    const double* A,
+    const double* B,
+    double* C) {
+  TORCH_CHECK(false,
+  "double Brgemm is currently not supported");
+}
+
 void brgemm_release() {
 #if AT_MKLDNN_ENABLED() && (defined(__x86_64__) || (defined(_M_X64) && !defined(_M_ARM64EC)))
   dnnl::ukernel::brgemm::release_hw_context();
+#endif
+}
+
+#if AT_MKLDNN_ENABLED() && (defined(__x86_64__) || (defined(_M_X64) && !defined(_M_ARM64EC)))
+std::shared_ptr<GemmHelper>
+#else
+std::shared_ptr<BrgemmKey>
+#endif
+brgemm_create(
+    int64_t M,
+    int64_t N,
+    int64_t K,
+    int64_t ld_a,
+    int64_t ld_b,
+    int64_t ld_c,
+    ScalarType dt_a,
+    ScalarType dt_b,
+    ScalarType dt_c,
+    const float alpha,
+    const float beta) {
+#if AT_MKLDNN_ENABLED() && (defined(__x86_64__) || (defined(_M_X64) && !defined(_M_ARM64EC)))
+  return Brgemm::create(M, N, K, ld_a, ld_b, ld_c, dt_a, dt_b, dt_c, alpha, beta);
+#else
+  return std::make_shared<BrgemmKey>(M, N, K, ld_a, ld_b, ld_c, dt_a, dt_b, dt_c, alpha, beta)
+#endif
+}
+
+void brgemm_execute(
+#if AT_MKLDNN_ENABLED() && (defined(__x86_64__) || (defined(_M_X64) && !defined(_M_ARM64EC)))
+const std::shared_ptr<GemmHelper>& ghelper,
+#else
+const std::shared_ptr<BrgemmKey>& ghelper,
+#endif
+  const void* A,
+  const void* B,
+  void* C) {
+#if AT_MKLDNN_ENABLED() && (defined(__x86_64__) || (defined(_M_X64) && !defined(_M_ARM64EC)))
+  Brgemm::execute(ghelper, A, B, C);
+#else
+TORCH_CHECK(false, "brgemm_execute is supported when oneDNN is enabled");
 #endif
 }
 
@@ -887,6 +959,40 @@ void pack(
   Pack::call(K, N, ld_in, ld_out, dt_in, dt_out, in, out);
 #else
   TORCH_CHECK(false, "pack is only supported on X64 with oneDNN enabled");
+#endif
+}
+
+#if AT_MKLDNN_ENABLED() && (defined(__x86_64__) || (defined(_M_X64) && !defined(_M_ARM64EC)))
+std::shared_ptr<pack_t>
+#else
+std::shared_ptr<PackKey>
+#endif
+pack_create(
+    int64_t K,
+    int64_t N,
+    int64_t ld_in,
+    int64_t ld_out,
+    ScalarType dt_in,
+    ScalarType dt_out) {
+#if AT_MKLDNN_ENABLED() && (defined(__x86_64__) || (defined(_M_X64) && !defined(_M_ARM64EC)))
+  return Pack::create(K, N, ld_in, ld_out, dt_in, dt_out);
+#else
+  return std::make_shared<PackKey>(K, N, ld_in, ld_out, dt_in, dt_out);
+#endif
+}
+
+void pack_execute(
+#if AT_MKLDNN_ENABLED() && (defined(__x86_64__) || (defined(_M_X64) && !defined(_M_ARM64EC)))
+const std::shared_ptr<pack_t>& pack,
+#else
+const std::shared_ptr<PackKey>& pack,
+#endif
+  const void* in,
+  void* out) {
+#if AT_MKLDNN_ENABLED() && (defined(__x86_64__) || (defined(_M_X64) && !defined(_M_ARM64EC)))
+  Pack::execute(pack, in, out);
+#else
+  TORCH_CHECK(false, "oneDNN Pack is supported when MKLDNN is truned on");
 #endif
 }
 

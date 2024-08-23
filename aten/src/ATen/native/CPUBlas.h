@@ -402,6 +402,68 @@ struct Brgemm : public KernelCache <BrgemmKey, GemmHelper> {
         .execute(A, B, (*value).A_B_offsets, C, (*value).scratchpad.data());
   }
 
+  static inline std::shared_ptr<GemmHelper> create(
+      int64_t M,
+      int64_t N,
+      int64_t K,
+      int64_t ld_a,
+      int64_t ld_b,
+      int64_t ld_c,
+      ScalarType dt_a,
+      ScalarType dt_b,
+      ScalarType dt_c,
+      const float alpha,
+      const float beta) {
+    auto&& key = BrgemmKey(
+        M,
+        N,
+        K,
+        int64_t(1),
+        ld_a,
+        ld_b,
+        ld_c,
+        dt_a,
+        dt_b,
+        dt_c,
+        alpha,
+        beta);
+    // Fetch/create GemmHelper object
+    auto&& value = fetch_or_create(key, [&]() {
+      auto&& v = std::make_shared<GemmHelper>(
+          M,
+          N,
+          K,
+          1,
+          ld_a,
+          ld_b,
+          ld_c,
+          dt_a,
+          dt_b,
+          dt_c,
+          alpha,
+          beta);
+      (*v).brg.generate();
+      return std::move(v);
+    });
+    return value;
+  }
+
+  // execute brgemm
+  static inline void execute(
+    const std::shared_ptr<GemmHelper>& ghelper,
+    const void* A,
+    const void* B,
+    void* C
+  ) {
+    if (get_current() != ghelper) {
+      //TODO only call once release_hw_context at end when it is supported
+      dnnl::ukernel::brgemm::release_hw_context();
+      ((*ghelper).brg).set_hw_context();
+      get_current() = ghelper;
+    }
+    ((*ghelper).brg).execute(A, B, (*ghelper).A_B_offsets, C, (*ghelper).scratchpad.data());
+  }
+
   static inline std::shared_ptr<GemmHelper>& get_current() {
     static thread_local std::shared_ptr<GemmHelper> current;
     return current;
@@ -450,6 +512,36 @@ struct Pack : public KernelCache <PackKey, pack_t> {
     }
   }
 
+  static inline std::shared_ptr<pack_t> create(
+      int64_t K,
+      int64_t N,
+      int64_t ld_in,
+      int64_t ld_out,
+      ScalarType dt_in,
+      ScalarType dt_out) {
+    auto&& key = PackKey(K, N, ld_in, ld_out, dt_in, dt_out);
+    auto&& pack = fetch_or_create(key, [&]() {
+      auto&& p = std::make_shared<pack_t>(
+          K, N, ld_in, ld_out, get_dnnl_dtype(dt_in), get_dnnl_dtype(dt_out));
+      if (need_pack(dt_in)) {
+        (*p).generate();
+      }
+      return std::move(p);
+    });
+    return pack;
+  }
+
+  static inline void execute(
+    const std::shared_ptr<pack_t>& pack,
+    const void* in,
+    void* out) {
+    if ((*pack).need_pack()) {
+      (*pack).execute(in, out);
+    } else {
+      TORCH_CHECK(false, "No need to pack");
+    }
+  }
+
   static inline bool need_pack(ScalarType dtype) {
     if (!at::globalContext().userEnabledMkldnn()) {
       return false;
@@ -492,6 +584,34 @@ TORCH_API void brgemm(
     const at::Half* B,
     float* C);
 
+#if AT_MKLDNN_ENABLED() && (defined(__x86_64__) || (defined(_M_X64) && !defined(_M_ARM64EC)))
+std::shared_ptr<GemmHelper>
+#else
+std::shared_ptr<BrgemmKey>
+#endif
+brgemm_create(
+    int64_t M,
+    int64_t N,
+    int64_t K,
+    int64_t ld_a,
+    int64_t ld_b,
+    int64_t ld_c,
+    ScalarType dt_a,
+    ScalarType dt_b,
+    ScalarType dt_c,
+    const float alpha,
+    const float beta);
+
+void brgemm_execute(
+#if AT_MKLDNN_ENABLED() && (defined(__x86_64__) || (defined(_M_X64) && !defined(_M_ARM64EC)))
+const std::shared_ptr<GemmHelper>& ghelper,
+#else
+const std::shared_ptr<BrgemmKey>& ghelper,
+#endif
+    const void* A,
+    const void* B,
+    void* C);
+
 TORCH_API void brgemm(
     int64_t M,
     int64_t N,
@@ -504,6 +624,32 @@ TORCH_API void brgemm(
     const at::BFloat16* A,
     const at::BFloat16* B,
     float* C);
+
+TORCH_API void brgemm(
+    int64_t M,
+    int64_t N,
+    int64_t K,
+    int64_t ld_a,
+    int64_t ld_b,
+    int64_t ld_c,
+    const float alpha,
+    const float beta,
+    const float* A,
+    const float* B,
+    float* C);
+
+TORCH_API void brgemm(
+    int64_t M,
+    int64_t N,
+    int64_t K,
+    int64_t ld_a,
+    int64_t ld_b,
+    int64_t ld_c,
+    const float alpha,
+    const float beta,
+    const double* A,
+    const double* B,
+    double* C);
 
 // Release brgemm hardware context
 void brgemm_release();
@@ -518,6 +664,28 @@ void pack(
     ScalarType dt_out,
     const void* in,
     void* out);
+
+#if AT_MKLDNN_ENABLED() && (defined(__x86_64__) || (defined(_M_X64) && !defined(_M_ARM64EC)))
+std::shared_ptr<pack_t>
+#else
+std::shared_ptr<PackKey>
+#endif
+pack_create(
+    int64_t K,
+    int64_t N,
+    int64_t ld_in,
+    int64_t ld_out,
+    ScalarType dt_in,
+    ScalarType dt_out);
+
+void pack_execute(
+#if AT_MKLDNN_ENABLED() && (defined(__x86_64__) || (defined(_M_X64) && !defined(_M_ARM64EC)))
+const std::shared_ptr<pack_t>& pack,
+#else
+const std::shared_ptr<PackKey>& pack,
+#endif
+  const void* in,
+  void* out);
 
 // Whether pack is needed in the platform.
 bool need_pack(ScalarType dt_in);
