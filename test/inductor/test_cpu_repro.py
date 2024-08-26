@@ -4214,6 +4214,87 @@ class CPUReproTests(TestCase):
             n_veckernel = 6 if op is torch.masked.mean else 3
             check_metrics_vec_kernel_count(n_veckernel)
 
+    @requires_vectorization
+    def test_full_bits_lowp(self):
+        from torch._dynamo.utils import detect_fake_mode
+        from torch._inductor.compile_fx import shape_env_from_inputs
+        from torch._inductor.debug import DebugContext
+        from torch._inductor.graph import GraphLowering
+        from torch._inductor.virtualized import V
+        from torch.fx.passes.fake_tensor_prop import FakeTensorProp
+
+        def check_use_full_bits(func, shapes, dtype, mixed, check_vecn):
+            example_inputs = [torch.randn(shape, dtype=dtype) for shape in shapes]
+            if mixed:
+                example_inputs[0] = example_inputs[0].to(
+                    dtype=torch.half if dtype == torch.bfloat16 else torch.bfloat16)
+            self.common(func, example_inputs)
+            gm, _ = torch._dynamo.export(func)(*example_inputs)
+            gm = torch.fx.symbolic_trace(gm)
+            shape_env = shape_env_from_inputs(example_inputs)
+            fake_mode = detect_fake_mode(example_inputs)
+            if not fake_mode:
+                fake_mode = torch._subclasses.FakeTensorMode()
+                FakeTensorProp(gm, mode=fake_mode).propagate(*example_inputs)
+            else:
+                FakeTensorProp(gm, mode=fake_mode).propagate_dont_convert_inputs(
+                    *example_inputs
+                )
+
+            with V.set_fake_mode(fake_mode):
+                graph = GraphLowering(
+                    gm,
+                    shape_env=shape_env,
+                )
+                with V.set_graph_handler(graph), V.set_debug_handler(DebugContext()):
+                    graph.run(*example_inputs)
+                    code, _ = graph.codegen()
+                    if check_vecn:
+                        self.assertTrue(
+                            "at::vec::VectorizedN" in code
+                            or "at::vec::convert<float,2" in code
+                        )
+                    else:
+                        self.assertFalse(
+                            "at::vec::VectorizedN" in code
+                            or "at::vec::convert<float,2" in code
+                        )
+
+        funcs = []
+
+        def func0(arg0, arg1):
+            return torch.ops.aten.sum(
+                torch.ops.aten.add(torch.ops.aten.atanh(arg0), arg1), (2, 3)
+            )
+
+        funcs.append(func0)
+
+        def func1(arg0):
+            v = torch.ops.prims.convert_element_type.default(arg0, torch.float)
+            v = torch.ops.aten.add(torch.ops.aten.atanh(arg0), v)
+            return torch.ops.prims.convert_element_type.default(v, arg0.dtype)
+
+        funcs.append(func1)
+
+        def func2(arg0, arg1):
+            v = torch.ops.aten.atanh(arg0)
+            v = torch.ops.aten.add(v, arg1)
+            return torch.ops.prims.convert_element_type.default(v, arg1.dtype)
+
+        funcs.append(func2)
+
+        example_shapes = [
+            [(10, 32, 20, 20), (10, 32, 20, 20)],
+            [(10, 32, 20, 20)],
+            [(10, 32, 20, 20), (10, 32, 20, 20)],
+        ]
+        mixed_types = [False, False, True]
+        check_vecns = [True, True, True]
+
+        for dtype in [torch.bfloat16, torch.float16]:
+            for func, shapes, mixed, check_vecn in zip(funcs, example_shapes, mixed_types, check_vecns):
+                check_use_full_bits(func, shapes, dtype, mixed, check_vecn)
+
 
 if __name__ == "__main__":
     from torch._inductor.test_case import run_tests
