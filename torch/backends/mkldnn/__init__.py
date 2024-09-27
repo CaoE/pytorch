@@ -64,18 +64,20 @@ class verbose:
         return False
 
 
-def set_flags(_enabled, _deterministic=None):
-    orig_flags = (torch._C._get_mkldnn_enabled(), torch._C._get_mkldnn_deterministic())
+def set_flags(_enabled, _deterministic=None, _ukernel=None):
+    orig_flags = (torch._C._get_mkldnn_enabled(), torch._C._get_mkldnn_deterministic(), torch._C._get_mkldnn_ukernel_enabled())
     torch._C._set_mkldnn_enabled(_enabled)
     if _deterministic is not None:
         torch._C._set_mkldnn_deterministic(_deterministic)
+    if _ukernel is not None:
+        torch._C._set_mkldnn_ukernel_enabled(_ukernel)
     return orig_flags
 
 
 @contextmanager
-def flags(enabled=False, deterministic=False):
+def flags(enabled=False, deterministic=False, ukernel=False):
     with __allow_nonbracketed_mutation():
-        orig_flags = set_flags(enabled, deterministic)
+        orig_flags = set_flags(enabled, deterministic, ukernel)
     try:
         yield
     finally:
@@ -88,6 +90,7 @@ class MkldnnModule(PropModule):
         super().__init__(m, name)
 
     enabled = ContextProp(torch._C._get_mkldnn_enabled, torch._C._set_mkldnn_enabled)
+    ukernel_enabled = ContextProp(torch._C._get_mkldnn_ukernel_enabled, torch._C._set_mkldnn_ukernel_enabled)
     deterministic = ContextProp(
         torch._C._get_mkldnn_deterministic, torch._C._set_mkldnn_deterministic
     )
@@ -95,6 +98,7 @@ class MkldnnModule(PropModule):
 
 if TYPE_CHECKING:
     enabled: ContextProp
+    ukernel_enabled: ContextProp
     deterministic: ContextProp
 
 sys.modules[__name__] = MkldnnModule(sys.modules[__name__], __name__)

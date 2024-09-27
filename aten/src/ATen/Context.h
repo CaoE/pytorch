@@ -200,6 +200,8 @@ class TORCH_API Context {
   void setUserEnabledCuDNN(bool e);
   bool userEnabledMkldnn() const;
   void setUserEnabledMkldnn(bool e);
+  bool userEnabledMkldnnUkernel() const;
+  void setUserEnabledMkldnnUkernel(bool e);
   bool benchmarkCuDNN() const;
   void setBenchmarkCuDNN(bool);
   int benchmarkLimitCuDNN() const;
@@ -408,6 +410,7 @@ class TORCH_API Context {
   bool allow_fp16_reduction_cublas = true;
   bool allow_bf16_reduction_cublas = true;
   bool enabled_mkldnn = true;
+  bool enabled_mkldnn_ukernel = False;
   bool enabled_nnpack = true;
   at::LinalgBackend linalg_preferred_backend =
       c10::utils::check_env("TORCH_LINALG_PREFER_CUSOLVER") == true

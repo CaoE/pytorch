@@ -291,7 +291,7 @@ inline void pad_remain_row_col_zero(
 
 }
 
-template <typename scalar_t, typename mask_t, int64_t q_split_size, int64_t kv_split_size, bool with_pack=false>
+template <typename scalar_t, typename mask_t, int64_t q_split_size, int64_t kv_split_size, bool could_pack=false>
 void cpu_flash_attention(
     const Tensor& output,
     const Tensor& logsumexp,
@@ -387,22 +387,29 @@ void cpu_flash_attention(
   // for (q @ k.T) @ v [qSplitSize, kvSplitSize] x [kvSplitSize, headSize] -> [qSplitSize, headSize],
   // we need to split headSize with packb_size for packing v
   // TODO Simplify the check when oneDNN supports fused pack with transpose and has better performance
-  if (with_pack) {
-    need_pack = num_head >= 4 && headSize % packb_size == 0 && kvSize >= packb_size;
-    if (need_pack) {
-      float pack_size = batchSize * num_head * kvSize * headSize / 1024;
-      float gemm_size_per_thread =
-          (batchSize * num_head * qSlice + num_thread - 1) / num_thread *
-          qSplitSize * (is_causal ? qSize : kvSize) * headSize / 1024;
-      float gsize = gemm_size_per_thread / pack_size;
-      // When the number of gemm is much greater than the number of pack,
-      // the pack and padding overhead can be overlaped.
-      if (pack_size < 2688) {
-        need_pack = gsize >= 36 || (gsize >= 24 && headSize > packb_size);
-      } else if (pack_size < 16384) {
-        need_pack = gsize >= (is_causal ? 54 : 52);
-      } else {
-        need_pack = gsize >= (is_causal ? 54 : 40);
+  if (could_pack) {
+    // Use torch.backends.mkldnn.flags(ukernel=True) or torch.backends.mkldnn.ukernel_enabled = True
+    // to force choose brgemm implementation, otherwise a heuristic check will be used to
+    // decide whether to choose the brgemm implementation.
+    if (at::globalContext().userEnabledMkldnnUkernel()) {
+      need_pack = true;
+    } else {
+      need_pack = num_head >= 4 && headSize >= packb_size / 2 && kvSize >= packb_size;
+      if (need_pack) {
+        float pack_size = batchSize * num_head * kvSize * headSize / 1024;
+        float gemm_size_per_thread =
+            (batchSize * num_head * qSlice + num_thread - 1) / num_thread *
+            qSplitSize * (is_causal ? qSize : kvSize) * headSize / 1024;
+        float gsize = gemm_size_per_thread / pack_size;
+        // When the number of gemm is much greater than the number of pack,
+        // the pack and padding overhead can be overlaped.
+        if (pack_size < 2688) {
+          need_pack = gsize >= 36 || (gsize >= 24 && headSize > packb_size);
+        } else if (pack_size < 16384) {
+          need_pack = gsize >= (is_causal ? 54 : 52);
+        } else {
+          need_pack = gsize >= (is_causal ? 54 : 40);
+        }
       }
     }
   }

@@ -48,6 +48,14 @@ void Context::setUserEnabledMkldnn(bool e) {
   enabled_mkldnn = e;
 }
 
+bool Context::userEnabledMkldnnUkernel() const {
+  return enabled_mkldnn_ukernel;
+}
+
+void Context::setUserEnabledMkldnnUkernel(bool e) {
+  enabled_mkldnn_ukernel = e;
+}
+
 bool Context::deterministicCuDNN() const {
   return deterministic_cudnn;
 }

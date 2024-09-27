@@ -834,6 +834,25 @@ PyObject* THPModule_userEnabledMkldnn(PyObject* _unused, PyObject* noargs) {
     Py_RETURN_FALSE;
 }
 
+PyObject* THPModule_setUserEnabledMkldnnUkernel(PyObject* _unused, PyObject* arg) {
+  HANDLE_TH_ERRORS
+  TORCH_CHECK(
+      PyBool_Check(arg),
+      "set_enabled_mkldnn_ukernel expects a bool, "
+      "but got ",
+      THPUtils_typename(arg));
+  at::globalContext().setUserEnabledMkldnnUkernel(arg == Py_True);
+  Py_RETURN_NONE;
+  END_HANDLE_TH_ERRORS
+}
+
+PyObject* THPModule_userEnabledMkldnnUkernel(PyObject* _unused, PyObject* noargs) {
+  if (at::globalContext().userEnabledMkldnnUkernel())
+    Py_RETURN_TRUE;
+  else
+    Py_RETURN_FALSE;
+}
+
 PyObject* THPModule_setDeterministicCuDNN(PyObject* _unused, PyObject* arg) {
   HANDLE_TH_ERRORS
   TORCH_CHECK(
@@ -1408,6 +1427,8 @@ static PyMethodDef TorchMethods[] = { // NOLINT
     {"_set_cudnn_enabled", THPModule_setUserEnabledCuDNN, METH_O, nullptr},
     {"_get_mkldnn_enabled", THPModule_userEnabledMkldnn, METH_NOARGS, nullptr},
     {"_set_mkldnn_enabled", THPModule_setUserEnabledMkldnn, METH_O, nullptr},
+    {"_get_mkldnn_ukernel_enabled", THPModule_userEnabledMkldnnUkernel, METH_NOARGS, nullptr},
+    {"_set_mkldnn_ukernel_enabled", THPModule_setUserEnabledMkldnnUkernel, METH_O, nullptr},
     {"_get_cudnn_allow_tf32", THPModule_allowTF32CuDNN, METH_NOARGS, nullptr},
     {"_set_cudnn_allow_tf32", THPModule_setAllowTF32CuDNN, METH_O, nullptr},
     {"_get_cudnn_benchmark", THPModule_benchmarkCuDNN, METH_NOARGS, nullptr},
