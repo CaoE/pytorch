@@ -125,7 +125,7 @@ class Benchmarker:
     @maybe_time
     @count
     def benchmark_cpu(
-        self: Self, _callable: Callable[[], Any], warmup: int = 20, rep: int = 100
+        self: Self, _callable: Callable[[], Any], warmup: int = 500, rep: int = 500
     ) -> float:
         """Benchmark the CPU callable, `_callable`, and return the median runtime,
         in milliseconds.

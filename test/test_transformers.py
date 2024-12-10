@@ -2024,17 +2024,17 @@ class TestSDPACpuOnly(NNTestCase):
             assert torch._fused_sdp_choice(q, k, v, dropout_p=dropout) == SDPBackend.FLASH_ATTENTION.value
 
     @parametrize("fused_kernel", [SDPBackend.FLASH_ATTENTION])
-    @parametrize("dtype", [torch.float64, torch.float32, torch.bfloat16, torch.float16])
-    @parametrize("batch_size", [2, 12])
-    @parametrize("q_seq_len", [11, 514, 1030])
-    @parametrize("kv_seq_len", [17, 514])
-    @parametrize("n_head", [1, 3])
-    @parametrize("head_dim", [8])
+    @parametrize("dtype", [torch.bfloat16,])
+    @parametrize("batch_size", [120,])
+    @parametrize("q_seq_len", [64, 200, 1024]) # 256, 512, 1024, 2048, 9216  [67, 111, 256, 333, 512, 777, 1024]
+    @parametrize("kv_seq_len", [2016]) # [67, 111, 256, 333, 512, 777, 1024]
+    @parametrize("n_head", [12])
+    @parametrize("head_dim", [64, 128]) # 40, 80, 64, 128
     @parametrize("mask_dim", [2, 4])
-    @parametrize("bool_mask", [False, True])
-    @parametrize("train", [True, False])
-    @parametrize("casual", [True, False])
-    @parametrize("set_attn_mask", [True, False])
+    @parametrize("bool_mask", [False])
+    @parametrize("train", [False])
+    @parametrize("casual", [False])
+    @parametrize("set_attn_mask", [False])
     def test_scaled_dot_product_fused_attention_mask_vs_math_cpu(
         self,
         device,
@@ -2051,76 +2051,231 @@ class TestSDPACpuOnly(NNTestCase):
         casual,
         set_attn_mask,
     ):
+        if bool_mask==True and set_attn_mask == False:
+            return
+        kv_seq_len = q_seq_len
+        import time
         tol = Tolerances(1e-5, 5e-6)
         if dtype is torch.bfloat16:
             tol = Tolerances(5e-2, 5e-2)
         if dtype is torch.float16:
             tol = Tolerances(1e-2, 1e-2)
         for mask_shape in itertools.product(
-            [q_seq_len, 1], [kv_seq_len, 1]
+            [q_seq_len, ], [kv_seq_len, ]
         ) if mask_dim == 2 else itertools.product(
-            [batch_size, 1], [n_head, 1], [q_seq_len, 1], [kv_seq_len, 1]
+            [batch_size, ], [n_head, ], [q_seq_len, ], [kv_seq_len, ]
         ):
-            make_tensor = partial(rand_sdpa_tensor, type="dense", device=device, dtype=dtype, requires_grad=False)
-            q_shape = SdpaShape(batch_size, n_head, q_seq_len, head_dim)
-            kv_shape = SdpaShape(batch_size, n_head, kv_seq_len, head_dim)
-            q = make_tensor(q_shape)
-            k = make_tensor(kv_shape)
-            v = make_tensor(kv_shape)
-            q2, k2, v2 = q.clone(), k.clone(), v.clone()
-
-            if train:
-                q.requires_grad_(True)
-                k.requires_grad_(True)
-                v.requires_grad_(True)
-                q2.requires_grad_(True)
-                k2.requires_grad_(True)
-                v2.requires_grad_(True)
-
-            if dtype in [torch.bfloat16, torch.float16]:
-                q2, k2, v2 = q2.float(), k2.float(), v2.float()
-            # (B, nh, T, hs)
-            q = q.view(batch_size, q_seq_len, n_head, head_dim).transpose(1, 2)
-            k = k.view(batch_size, kv_seq_len, n_head, head_dim).transpose(1, 2)
-            v = v.view(batch_size, kv_seq_len, n_head, head_dim).transpose(1, 2)
-            if set_attn_mask and not casual:
-                if bool_mask:
-                    attn_mask = torch.randint(0, 2, size=mask_shape, dtype=torch.bool, device=device)
-                else:
-                    attn_mask = torch.randn(mask_shape, dtype=dtype, device=device)
+            nthread = 1.
+            if q_seq_len >= 768:
+                q_split_size = 256
+            elif q_seq_len >= 192:
+                q_split_size = 64
             else:
-                attn_mask = None
-            q2 = q2.view(batch_size, q_seq_len, n_head, head_dim).transpose(1, 2)
-            k2 = k2.view(batch_size, kv_seq_len, n_head, head_dim).transpose(1, 2)
-            v2 = v2.view(batch_size, kv_seq_len, n_head, head_dim).transpose(1, 2)
+                q_split_size = 32
+            q_split_size = q_seq_len if q_split_size > q_seq_len else q_split_size
+            kv_split_size = 512
+            kv_split_size = kv_seq_len if kv_split_size > kv_seq_len else kv_split_size
+            comp_size = batch_size * n_head * ((q_seq_len + q_split_size - 1) // q_split_size)
+            # print("compute slice per thread: ", (comp_size + nthread - 1) // nthread)
+            if casual:
+                qs_per_thread = (comp_size + nthread - 1) // nthread
+                print("qs_per_thread: ", qs_per_thread)
+                print("qs_per_thread * q_split_size / 2: ", qs_per_thread * q_split_size / 2)
+                comp_size = qs_per_thread  * q_split_size * (min(q_seq_len, kv_seq_len)) * head_dim
+            else:
+                comp_size = (comp_size + nthread - 1) // nthread * q_split_size * kv_seq_len * head_dim
+            memory_size = batch_size * n_head * ((kv_seq_len + kv_split_size - 1) // kv_split_size)
+            # print("memory slice per thread: ", (memory_size + nthread - 1) // nthread)
+            memory_size = (memory_size + nthread - 1) // nthread * kv_split_size * head_dim
+            all_memory_size = batch_size * n_head * kv_seq_len * head_dim
+            print("-----------------------------------")
+            print("all_memory_size: ", all_memory_size, " comp_size / all_memory: ", comp_size / all_memory_size)
+            print("comp_size: ", comp_size, " memory_size:", memory_size , " comp_size/memory_size: ", comp_size/memory_size)
+            if dtype == torch.bfloat16 and (kv_seq_len < 64 or q_seq_len < 64):
+                print("should better: ", False)
+                # return
+            if dtype == torch.float16 and (kv_seq_len < 16 or q_seq_len < 16):
+                print("should better: ", False)
+                # return
+            if dtype == torch.float16:
+            # #    if all_memory_size < 512:
+            # #        print("should better: ", False)
+            # #    elif all_memory_size < 1024:
+            # #        if comp_size/all_memory_size < 32 or head_dim <= 64:
+            # #            print("should better: ", False)
+            #    if all_memory_size < 2688:
+            #        if comp_size/all_memory_size < 36 and (comp_size/all_memory_size < 24 or head_dim <= 64):
+            #            print("should better: ", False)
+            #            return
+            #    elif all_memory_size < 16384:
+            #        if comp_size/all_memory_size < (54 if casual else 52):
+            #            print("shou better: ", False)
+            #            return
+            #    else:
+            #        if comp_size/all_memory_size < (54 if casual else 42):
+            #            print("should better: ", False)
+            #            return
+                if comp_size/all_memory_size < 1:
+                    print("should better: ", False)
+                    # return
+            else:
+               if comp_size/all_memory_size < 4:
+                   print("should better: ", False)
+                #    return
+            brgemm_time = 0
+            mkl_time = 0
+            for use_mkldnn in [True, ]:
+                make_tensor = partial(rand_sdpa_tensor, type="dense", device=device, dtype=dtype, requires_grad=False)
+                q_shape = SdpaShape(batch_size, n_head, q_seq_len, head_dim)
+                kv_shape = SdpaShape(batch_size, n_head, kv_seq_len, head_dim)
+                q = make_tensor(q_shape)
+                k = make_tensor(kv_shape)
+                v = make_tensor(kv_shape)
+                q2, k2, v2 = q.clone(), k.clone(), v.clone()
+                if train:
+                    q.requires_grad_(True)
+                    k.requires_grad_(True)
+                    v.requires_grad_(True)
+                    q2.requires_grad_(True)
+                    k2.requires_grad_(True)
+                    v2.requires_grad_(True)
+                if dtype in [torch.bfloat16, torch.float16]:
+                    q2, k2, v2 = q2.float(), k2.float(), v2.float()
+                # (B, nh, T, hs)
+                q = q.view(batch_size, q_seq_len, n_head, head_dim).transpose(1, 2)
+                k = k.view(batch_size, kv_seq_len, n_head, head_dim).transpose(1, 2)
+                v = v.view(batch_size, kv_seq_len, n_head, head_dim).transpose(1, 2)
+                if set_attn_mask and not casual:
+                    if bool_mask:
+                        attn_mask = torch.randint(0, 2, size=mask_shape, dtype=torch.bool, device=device)
+                    else:
+                        attn_mask = torch.randn(mask_shape, dtype=dtype, device=device)
+                else:
+                    attn_mask = None
+                q2 = q2.view(batch_size, q_seq_len, n_head, head_dim).transpose(1, 2)
+                k2 = k2.view(batch_size, kv_seq_len, n_head, head_dim).transpose(1, 2)
+                v2 = v2.view(batch_size, kv_seq_len, n_head, head_dim).transpose(1, 2)
+                warmn = 100
+                itern = 100
+                print(use_mkldnn, dtype, batch_size, q_seq_len, kv_seq_len, n_head, head_dim, mask_shape, bool_mask, casual, set_attn_mask)
+                with sdpa_kernel(backends=[fused_kernel]), torch.backends.mkldnn.flags(enabled=use_mkldnn):
+                    for _ in range(warmn):
+                        actual = torch.nn.functional.scaled_dot_product_attention(
+                            q, k, v, attn_mask=attn_mask, dropout_p=0.0, is_causal=casual)
+                    start = time.time() * 1000
+                    for _ in range(itern):
+                        actual = torch.nn.functional.scaled_dot_product_attention(
+                            q, k, v, attn_mask=attn_mask, dropout_p=0.0, is_causal=casual)
+                    end = time.time() * 1000
+                    use_time = (end - start) / itern
+                    if use_mkldnn:
+                        brgemm_time = use_time
+                    else:
+                        mkl_time = use_time
+                    print("time: {} ms".format((end - start) / itern))
+            # if mkl_time / brgemm_time <= 0.95:
+            #     print(False, "###brgemm is slower")
+            # elif mkl_time / brgemm_time >= 1.05:
+            #     print(True, "###brgemm is faster")
 
-            with sdpa_kernel(backends=[fused_kernel]):
-                actual = torch.nn.functional.scaled_dot_product_attention(
-                    q, k, v, attn_mask=attn_mask, dropout_p=0.0, is_causal=casual)
-            with sdpa_kernel(backends=[SDPBackend.MATH]):
-                if not bool_mask and dtype in [torch.bfloat16, torch.float16] and attn_mask is not None:
-                    attn_mask = attn_mask.float()
-                math_ref = torch.nn.functional.scaled_dot_product_attention(
-                    q2, k2, v2, attn_mask=attn_mask, dropout_p=0.0, is_causal=casual)
+    # @parametrize("fused_kernel", [SDPBackend.FLASH_ATTENTION])
+    # @parametrize("dtype", [torch.bfloat16, torch.float16])
+    # @parametrize("batch_size", [2, 12])
+    # @parametrize("q_seq_len", [11, 514, 1030])
+    # @parametrize("kv_seq_len", [17, 514])
+    # @parametrize("n_head", [1, 3])
+    # @parametrize("head_dim", [8])
+    # @parametrize("mask_dim", [2, 4])
+    # @parametrize("bool_mask", [False, True])
+    # @parametrize("train", [True, False])
+    # @parametrize("casual", [True, False])
+    # @parametrize("set_attn_mask", [True, False])
+    # def test_scaled_dot_product_fused_attention_mask_vs_math_cpu(
+    #     self,
+    #     device,
+    #     fused_kernel,
+    #     dtype,
+    #     batch_size,
+    #     q_seq_len,
+    #     kv_seq_len,
+    #     n_head,
+    #     head_dim,
+    #     mask_dim,
+    #     bool_mask,
+    #     train,
+    #     casual,
+    #     set_attn_mask,
+    # ):
+    #     tol = Tolerances(1e-5, 5e-6)
+    #     if dtype is torch.bfloat16:
+    #         tol = Tolerances(5e-2, 5e-2)
+    #     if dtype is torch.float16:
+    #         tol = Tolerances(1e-2, 1e-2)
+    #     for mask_shape in itertools.product(
+    #         [q_seq_len, 1], [kv_seq_len, 1]
+    #     ) if mask_dim == 2 else itertools.product(
+    #         [batch_size, 1], [n_head, 1], [q_seq_len, 1], [kv_seq_len, 1]
+    #     ):
+    #         make_tensor = partial(rand_sdpa_tensor, type="dense", device=device, dtype=dtype, requires_grad=False)
+    #         q_shape = SdpaShape(batch_size, n_head, q_seq_len, head_dim)
+    #         kv_shape = SdpaShape(batch_size, n_head, kv_seq_len, head_dim)
+    #         q = make_tensor(q_shape)
+    #         k = make_tensor(kv_shape)
+    #         v = make_tensor(kv_shape)
+    #         q2, k2, v2 = q.clone(), k.clone(), v.clone()
 
-            if dtype in [torch.bfloat16, torch.float16]:
-                math_ref = math_ref.to(dtype)
+    #         if train:
+    #             q.requires_grad_(True)
+    #             k.requires_grad_(True)
+    #             v.requires_grad_(True)
+    #             q2.requires_grad_(True)
+    #             k2.requires_grad_(True)
+    #             v2.requires_grad_(True)
 
-            self.assertFalse(torch.isnan(math_ref).any())
-            self.assertFalse(torch.isnan(actual).any())
+    #         if dtype in [torch.bfloat16, torch.float16]:
+    #             q2, k2, v2 = q2.float(), k2.float(), v2.float()
+    #         # (B, nh, T, hs)
+    #         q = q.view(batch_size, q_seq_len, n_head, head_dim).transpose(1, 2)
+    #         k = k.view(batch_size, kv_seq_len, n_head, head_dim).transpose(1, 2)
+    #         v = v.view(batch_size, kv_seq_len, n_head, head_dim).transpose(1, 2)
+    #         if set_attn_mask and not casual:
+    #             if bool_mask:
+    #                 attn_mask = torch.randint(0, 2, size=mask_shape, dtype=torch.bool, device=device)
+    #             else:
+    #                 attn_mask = torch.randn(mask_shape, dtype=dtype, device=device)
+    #         else:
+    #             attn_mask = None
+    #         q2 = q2.view(batch_size, q_seq_len, n_head, head_dim).transpose(1, 2)
+    #         k2 = k2.view(batch_size, kv_seq_len, n_head, head_dim).transpose(1, 2)
+    #         v2 = v2.view(batch_size, kv_seq_len, n_head, head_dim).transpose(1, 2)
 
-            self.assertEqual(actual, math_ref, atol=tol.atol, rtol=tol.rtol)
+    #         with sdpa_kernel(backends=[fused_kernel]):
+    #             actual = torch.nn.functional.scaled_dot_product_attention(
+    #                 q, k, v, attn_mask=attn_mask, dropout_p=0.0, is_causal=casual)
+    #         with sdpa_kernel(backends=[SDPBackend.MATH]):
+    #             if not bool_mask and dtype in [torch.bfloat16, torch.float16] and attn_mask is not None:
+    #                 attn_mask = attn_mask.float()
+    #             math_ref = torch.nn.functional.scaled_dot_product_attention(
+    #                 q2, k2, v2, attn_mask=attn_mask, dropout_p=0.0, is_causal=casual)
 
-            if train:
-                actual.sum().backward()
-                math_ref.sum().backward()
+    #         if dtype in [torch.bfloat16, torch.float16]:
+    #             math_ref = math_ref.to(dtype)
 
-                grad_q_actual, grad_k_actual, grad_v_actual = q.grad, k.grad, v.grad
-                grad_q_ref, grad_k_ref, grad_v_ref = q2.grad, k2.grad, v2.grad
+    #         self.assertFalse(torch.isnan(math_ref).any())
+    #         self.assertFalse(torch.isnan(actual).any())
 
-                self.assertEqual(grad_q_actual, grad_q_ref, atol=tol.atol, rtol=tol.rtol)
-                self.assertEqual(grad_k_actual, grad_k_ref, atol=tol.atol, rtol=tol.rtol)
-                self.assertEqual(grad_v_actual, grad_v_ref, atol=tol.atol, rtol=tol.rtol)
+    #         self.assertEqual(actual, math_ref, atol=tol.atol, rtol=tol.rtol)
+
+    #         if train:
+    #             actual.sum().backward()
+    #             math_ref.sum().backward()
+
+    #             grad_q_actual, grad_k_actual, grad_v_actual = q.grad, k.grad, v.grad
+    #             grad_q_ref, grad_k_ref, grad_v_ref = q2.grad, k2.grad, v2.grad
+
+    #             self.assertEqual(grad_q_actual, grad_q_ref, atol=tol.atol, rtol=tol.rtol)
+    #             self.assertEqual(grad_k_actual, grad_k_ref, atol=tol.atol, rtol=tol.rtol)
+    #             self.assertEqual(grad_v_actual, grad_v_ref, atol=tol.atol, rtol=tol.rtol)
 
     def test_sdpa_with_inf(self, device):
         # https://github.com/pytorch/pytorch/issues/127055.

@@ -16,6 +16,12 @@
 #else
 #include <ATen/ops/empty.h>
 #endif
+
+#include <iostream>
+#include <chrono>
+
+typedef std::chrono::nanoseconds res;
+
 namespace at::native {
 
 namespace {
@@ -318,6 +324,10 @@ static inline void transpose_pad_2x32_block(
       r1 = _mm512_setzero_si512();
     }
   }
+  // auto prefetch_addr = src + 32;
+  // _mm_prefetch(prefetch_addr, _MM_HINT_T0);
+  // prefetch_addr = src + ld_src + 32;
+  // _mm_prefetch(prefetch_addr, _MM_HINT_T0);
   // transpose
   d0 = _mm512_unpacklo_epi16(r0, r1);
   d1 = _mm512_unpackhi_epi16(r0, r1);
@@ -325,6 +335,16 @@ static inline void transpose_pad_2x32_block(
   r1 = _mm512_shuffle_i32x4(d0, d1, 0xdd);
   d0 = _mm512_shuffle_i32x4(r0, r1, 0x88);
   d1 = _mm512_shuffle_i32x4(r0, r1, 0xdd);
+
+  // auto idx0 = _mm512_set_epi16(
+  //   0x2f, 0x0f, 0x2e, 0x0e, 0x2d, 0x0d, 0x2c, 0x0c, 0x2b, 0x0b, 0x2a, 0x0a, 0x29, 0x09, 0x28, 0x08, 
+  //   0x27, 0x07, 0x26, 0x06, 0x25, 0x05, 0x24, 0x04, 0x23, 0x03, 0x22, 0x02, 0x21, 0x01, 0x20, 0x00);
+  // auto idx1 = _mm512_set_epi16(
+  //   0x3f, 0x1f, 0x3e, 0x1e, 0x3d, 0x1d, 0x3c, 0x1c, 0x3b, 0x1b, 0x3a, 0x1a, 0x39, 0x19, 0x38, 0x18,
+  //   0x37, 0x17, 0x36, 0x16, 0x35, 0x15, 0x34, 0x14, 0x33, 0x13, 0x32, 0x12, 0x31, 0x11, 0x30, 0x10);
+  // // new tranpose
+  // d0 = _mm512_permutex2var_epi16(r0, idx0, r1);
+  // d1 = _mm512_permutex2var_epi16(r0, idx1, r1);
 
   // store
   if (nrem < 16) {
@@ -349,7 +369,7 @@ TORCH_CHECK(false, "transpose_pad_2x32_block is only supported when avx512 is su
 }
 
 // If K % 2 != 0, pad K implicitly
-static inline void pack_vnni(
+static inline void pack_vnni2(
     const uint16_t* src,
     uint16_t* dst,
     int64_t ld_src,
@@ -379,8 +399,29 @@ static inline void pack_vnni(
       transpose_pad_2x32_block(src + bk * ld_src + bn, dst + bk * N + bn * 2, ld_src, 1, nrem);
     }
   }
+
+  // int64_t bn = 0;
+  // int64_t bk = 0;
+  // int64_t _K = K / 2 * 2;
+  // int64_t _N = N / 32 * 32;
+  // for (; bk < _K; bk += 2) {
+  //   for (; bn < _N; bn += 32) {
+  //     transpose_pad_2x32_block(src + bk * ld_src + bn, dst + bk * N + bn * 2, ld_src);
+  //   }
+  // }
+
+
+  // int64_t bn = 0;
+  // int64_t _K = K / 2 * 2;
+  // int64_t _N = N / 32 * 32;
+  // for (; bn < _N; bn += 32) {
+  //   int64_t bk = 0;
+  //   for (; bk < _K; bk += 2) {
+  //     transpose_pad_2x32_block(src + bk * ld_src + bn, dst + bk * N + bn * 2, ld_src);
+  //   }
+  // }
 #else
-TORCH_CHECK(false, "pack_vnni is only supported when avx512 is supported")
+TORCH_CHECK(false, "pack_vnni2 is only supported when avx512 is supported")
 #endif
 }
 
@@ -461,6 +502,7 @@ void cpu_flash_attention(
   int64_t qSplitSize = q_split_size > qSize ? qSize : q_split_size;
   int64_t kvSplitSize = kv_split_size > kvSize ? kvSize : kv_split_size;
   int64_t qSlice = (qSize + qSplitSize - 1) / qSplitSize;
+  int64_t qTail = (qSize - 1) % qSplitSize + 1;
   int64_t kvSlice = (kvSize + kvSplitSize - 1) / kvSplitSize;
   int64_t kvTail = (kvSize - 1) % kvSplitSize + 1;
   int64_t num_thread = at::get_num_threads();
@@ -484,6 +526,7 @@ void cpu_flash_attention(
           (is_causal ? std::min(qSize, kvSize) : kvSize) * headSize;
       need_pack = gemm_size_per_thread / pack_size >= (dtype == at::ScalarType::BFloat16 ? 4 : 1);
     }
+    need_pack = true;
   }
 
   // Pad is needed for packing when K is not even
@@ -570,16 +613,20 @@ void cpu_flash_attention(
               /* ld_dst */ kvBlockSize);
 
           // Pack [headSize, kvBlockSize]
-          pack_vnni(
+          // auto t1 = std::chrono::high_resolution_clock::now();
+          pack_vnni2(
             /* src */ reinterpret_cast<const uint16_t*>(transpose_ptr),
             /* dst */ reinterpret_cast<uint16_t*>(key_reorder_ptr + i * num_head * eheadSize * kvSize +
                     j * eheadSize * kvSize + n * eheadSize),
             /* ld_src */ kvBlockSize,
             /* K */ headSize,
             /* N */ kvBlockSize);
+          // auto t2 = std::chrono::high_resolution_clock::now();
+          // std::cout << "pack1: " << std::chrono::duration_cast<res>(t2 - t1).count() << "ns\n";
 
+          // t1 = std::chrono::high_resolution_clock::now();
           // Pack [kvBlockSize, headSize]
-          pack_vnni(
+          pack_vnni2(
             /* src */ reinterpret_cast<const uint16_t*>(v_data + i * vStrideB + j * vStrideH + n * vStrideN),
             /* dst */ reinterpret_cast<uint16_t*>(value_reorder_ptr +
                     i * num_head * kv_padding_size * headSize +
@@ -587,6 +634,8 @@ void cpu_flash_attention(
             /* ld_src */ vStrideN,
             /* K */ kvBlockSize,
             /* N */ headSize);
+          // t2 = std::chrono::high_resolution_clock::now();
+          // std::cout << "pack2: " << std::chrono::duration_cast<res>(t2 - t1).count() << "ns\n";
 
           // Move to the next query
           at::native::data_index_step(i, batchSize, j, num_head, l, kvSlice);
@@ -607,7 +656,101 @@ void cpu_flash_attention(
     scalar_t* query_t_padding_ptr = (!headSize_even && need_pack)
             ? query_padding_ptr + ompIdx * qSplitSize * eheadSize
             : nullptr;
-
+  // at::native::cpublas::GemmHelper * qk_gemm, qk_gemm_ktail, qk_gemm_qtail, qk_gemm_qktail;
+  // at::native::cpublas::GemmHelper * av_gemm, av_gemm_tail, av_gemm_bias, av_gemm_bias_tail;
+  // auto qk_gemm = at::native::cpublas::brgemm_create(
+  //               qSplitSize,
+  //               kvSplitSize,
+  //               eheadSize,
+  //               headSize_even ? qStrideM : eheadSize,
+  //               kvSplitSize,
+  //               kvSplitSize,
+  //               false,
+  //               dtype,
+  //               dtype,
+  //               accumulate_dtype);
+  // auto qk_gemm_ktail = kvTail == kvSplitSize ? qk_gemm :at::native::cpublas::brgemm_create(
+  //               qSplitSize,
+  //               kvTail,
+  //               eheadSize,
+  //               headSize_even ? qStrideM : eheadSize,
+  //               kvTail,
+  //               kvTail,
+  //               false,
+  //               dtype,
+  //               dtype,
+  //               accumulate_dtype);
+  // // std::cout << "qk_gemm == qk_gemm_ktail: " << (qk_gemm == qk_gemm_ktail) << "\n";
+  // auto qk_gemm_qtail = qTail == qSplitSize ? qk_gemm : at::native::cpublas::brgemm_create(
+  //               qTail,
+  //               kvSplitSize,
+  //               eheadSize,
+  //               headSize_even ? qStrideM : eheadSize,
+  //               kvSplitSize,
+  //               kvSplitSize,
+  //               false,
+  //               dtype,
+  //               dtype,
+  //               accumulate_dtype);
+  // // std::cout << "qk_gemm == qk_gemm_qtail: " << (qk_gemm == qk_gemm_qtail) << "\n";
+  // auto qk_gemm_qktail = (qTail == qSplitSize && kvTail == kvSplitSize) ? qk_gemm : at::native::cpublas::brgemm_create(
+  //               qTail,
+  //               kvTail,
+  //               eheadSize,
+  //               headSize_even ? qStrideM : eheadSize,
+  //               kvTail,
+  //               kvTail,
+  //               false,
+  //               dtype,
+  //               dtype,
+  //               accumulate_dtype);
+  // // std::cout << "qk_gemm == qk_gemm_qktail: " << (qk_gemm == qk_gemm_qktail) << "\n";
+  // auto av_gemm = at::native::cpublas::brgemm_create(
+  //               qSplitSize,
+  //               headSize,
+  //               ekvSplitSize,
+  //               ekvSplitSize,
+  //               headSize,
+  //               headSize,
+  //               false,
+  //               dtype,
+  //               dtype,
+  //               accumulate_dtype);
+  // // std::cout << "qk_gemm == av_gemm: " << (qk_gemm == av_gemm) << "\n";
+  // auto av_gemm_tail = ekvTail == ekvSplitSize ? av_gemm : at::native::cpublas::brgemm_create(
+  //               qSplitSize,
+  //               headSize,
+  //               ekvTail,
+  //               ekvTail,
+  //               headSize,
+  //               headSize,
+  //               false,
+  //               dtype,
+  //               dtype,
+  //               accumulate_dtype);
+  // // std::cout << "av_gemm_tail == av_gemm: " << (av_gemm_tail == av_gemm) << "\n";
+  // auto av_gemm_bias = at::native::cpublas::brgemm_create(
+  //               qSplitSize,
+  //               headSize,
+  //               ekvSplitSize,
+  //               ekvSplitSize,
+  //               headSize,
+  //               headSize,
+  //               true,
+  //               dtype,
+  //               dtype,
+  //               accumulate_dtype);
+  // auto av_gemm_bias_tail = ekvTail == ekvSplitSize ? av_gemm_bias : at::native::cpublas::brgemm_create(
+  //               qSplitSize,
+  //               headSize,
+  //               ekvTail,
+  //               ekvTail,
+  //               headSize,
+  //               headSize,
+  //               true,
+  //               dtype,
+  //               dtype,
+  //               accumulate_dtype);
     for ([[maybe_unused]] auto z : c10::irange(begin, end)) {
       int64_t m = k * qSplitSize;
       int64_t qBlockSize = std::min(qSplitSize, qSize - m);
@@ -636,6 +779,7 @@ void cpu_flash_attention(
         // Calculate scale * q @ k.T
         if (need_pack) {
           if constexpr (is_reduced_floating_point_v<scalar_t>) {
+            // auto t1 = std::chrono::high_resolution_clock::now();
             cpublas::brgemm(
                 qBlockSize,
                 kvBlockSize,
@@ -650,6 +794,68 @@ void cpu_flash_attention(
                 key_reorder_ptr + i * num_head * eheadSize * kvSize +
                     j * eheadSize * kvSize + n * eheadSize,
                 qk_data);
+
+            // if (qBlockSize == qSplitSize) {
+            //   if (kvBlockSize == kvSplitSize) {
+            //     at::native::cpublas::brgemm_execute(
+            //       qk_gemm,
+            //       !headSize_even
+            //           ? query_t_padding_ptr
+            //           : q_data + i * qStrideB + j * qStrideH + m * qStrideM,
+            //       key_reorder_ptr + i * num_head * eheadSize * kvSize +
+            //           j * eheadSize * kvSize + n * eheadSize,
+            //       qk_data);
+            //   } else {
+            //     at::native::cpublas::brgemm_execute(
+            //       qk_gemm_ktail,
+            //       !headSize_even
+            //           ? query_t_padding_ptr
+            //           : q_data + i * qStrideB + j * qStrideH + m * qStrideM,
+            //       key_reorder_ptr + i * num_head * eheadSize * kvSize +
+            //           j * eheadSize * kvSize + n * eheadSize,
+            //       qk_data);
+            //   }
+            // } else {
+            //   if (kvBlockSize == kvSplitSize) {
+            //     at::native::cpublas::brgemm_execute(
+            //      qk_gemm_qtail,
+            //       !headSize_even
+            //           ? query_t_padding_ptr
+            //           : q_data + i * qStrideB + j * qStrideH + m * qStrideM,
+            //       key_reorder_ptr + i * num_head * eheadSize * kvSize +
+            //           j * eheadSize * kvSize + n * eheadSize,
+            //       qk_data);
+            //   } else {
+            //     at::native::cpublas::brgemm_execute(
+            //       qk_gemm_qktail,
+            //       !headSize_even
+            //           ? query_t_padding_ptr
+            //           : q_data + i * qStrideB + j * qStrideH + m * qStrideM,
+            //       key_reorder_ptr + i * num_head * eheadSize * kvSize +
+            //           j * eheadSize * kvSize + n * eheadSize,
+            //       qk_data);
+            //   }
+            // }
+
+            // at::native::cpublas::brgemm_execute(
+            //     std::move(qBlockSize == qSplitSize ? (kvBlockSize == kvSplitSize ? qk_gemm : qk_gemm_ktail) : (kvBlockSize == kvSplitSize ? qk_gemm_qtail : qk_gemm_qktail)),
+            //     !headSize_even
+            //         ? query_t_padding_ptr
+            //         : q_data + i * qStrideB + j * qStrideH + m * qStrideM,
+            //     key_reorder_ptr + i * num_head * eheadSize * kvSize +
+            //         j * eheadSize * kvSize + n * eheadSize,
+            //     qk_data);
+            // (*(qBlockSize == qSplitSize ? (kvBlockSize == kvSplitSize ? qk_gemm : qk_gemm_ktail) : (kvBlockSize == kvSplitSize ? qk_gemm_qtail : qk_gemm_qktail))).execute(
+            //   !headSize_even
+            //       ? query_t_padding_ptr
+            //       : q_data + i * qStrideB + j * qStrideH + m * qStrideM,
+            //   key_reorder_ptr + i * num_head * eheadSize * kvSize +
+            //       j * eheadSize * kvSize + n * eheadSize,
+            //   qk_data
+            // );
+
+            // auto t2 = std::chrono::high_resolution_clock::now();
+            // std::cout << "execute1: " << std::chrono::duration_cast<res>(t2 - t1).count() << "ns\n";
           }
         } else {
           cpublas::gemm(
@@ -768,6 +974,7 @@ void cpu_flash_attention(
         if (need_pack) {
           int64_t psize = n / kvSplitSize * ekvSplitSize;
           if constexpr (is_reduced_floating_point_v<scalar_t>) {
+            // auto t1 = std::chrono::high_resolution_clock::now();
             cpublas::brgemm(
                   qBlockSize,
                   headSize,
@@ -781,6 +988,67 @@ void cpu_flash_attention(
                       i * num_head * kv_padding_size * headSize +
                       j * kv_padding_size * headSize + psize * headSize,
                   dst_data);
+            
+            
+            // if (kvBlockSize == kvSplitSize) {
+            //   if (n == 0) {
+            //     at::native::cpublas::brgemm_execute(
+            //         // av_gemm,
+            //         av_gemm,
+            //         qk_reduced_data,
+            //         value_reorder_ptr +
+            //             i * num_head * kv_padding_size * headSize +
+            //             j * kv_padding_size * headSize + psize * headSize,
+            //         dst_data);
+            //   } else {
+            //     at::native::cpublas::brgemm_execute(
+            //         // av_gemm,
+            //         av_gemm_bias,
+            //         qk_reduced_data,
+            //         value_reorder_ptr +
+            //             i * num_head * kv_padding_size * headSize +
+            //             j * kv_padding_size * headSize + psize * headSize,
+            //         dst_data);
+            //   }
+            // } else {
+            //   if (n == 0) {
+            //     at::native::cpublas::brgemm_execute(
+            //         // av_gemm,
+            //         av_gemm_tail,
+            //         qk_reduced_data,
+            //         value_reorder_ptr +
+            //             i * num_head * kv_padding_size * headSize +
+            //             j * kv_padding_size * headSize + psize * headSize,
+            //         dst_data);
+            //   } else {
+            //     at::native::cpublas::brgemm_execute(
+            //         // av_gemm,
+            //         av_gemm_bias_tail,
+            //         qk_reduced_data,
+            //         value_reorder_ptr +
+            //             i * num_head * kv_padding_size * headSize +
+            //             j * kv_padding_size * headSize + psize * headSize,
+            //         dst_data);
+            //   }
+            // }
+
+            // at::native::cpublas::brgemm_execute(
+            //     // av_gemm,
+            //     std::move(kvBlockSize == kvSplitSize ? (n == 0 ? av_gemm : av_gemm_bias) : (n == 0 ? av_gemm_tail : av_gemm_bias_tail)),
+            //     qk_reduced_data,
+            //     value_reorder_ptr +
+            //         i * num_head * kv_padding_size * headSize +
+            //         j * kv_padding_size * headSize + psize * headSize,
+            //     dst_data);
+            // (*(kvBlockSize == kvSplitSize ? (n == 0 ? av_gemm : av_gemm_bias) : (n == 0 ? av_gemm_tail : av_gemm_bias_tail))).execute(
+            //   qk_reduced_data,
+            //   value_reorder_ptr +
+            //       i * num_head * kv_padding_size * headSize +
+            //       j * kv_padding_size * headSize + psize * headSize,
+            //   dst_data
+            // );
+            // auto t2 = std::chrono::high_resolution_clock::now();
+            // std::cout << "execute2: " << std::chrono::duration_cast<res>(t2 - t1).count() << "ns\n";
           }
         } else {
           cpublas::gemm(
@@ -829,6 +1097,7 @@ void cpu_flash_attention(
       cpublas::brgemm_release();
     }
   });
+  // print_time();
 }
 
 template <typename scalar_t, typename mask_t, int64_t q_split_size, int64_t kv_split_size>

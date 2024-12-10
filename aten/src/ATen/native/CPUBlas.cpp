@@ -3,7 +3,7 @@
 #include <ATen/native/mkl/LinearAlgebra.h>
 #include <ATen/native/mkldnn/Matmul.h>
 #include <ATen/Config.h>
-
+#include <c10/util/flat_hash_map.h>
 #include <c10/util/SmallBuffer.h>
 #include <c10/util/irange.h>
 
@@ -63,6 +63,64 @@ extern "C" void zaxpy_(int *n, void *a, const void *x, int *incx, void *y, int *
 #include <oneapi/dnnl/dnnl_ukernel.hpp>
 #include <oneapi/dnnl/dnnl.hpp>
 #endif // oneDNN BRGEMM
+#include <iostream>
+#include <chrono>
+#include <mutex>
+#include <ATen/Parallel.h>
+typedef std::chrono::nanoseconds res;
+
+std::mutex print_mtx;
+struct time_hepler {
+  time_hepler() {
+    for (int i = 0; i < 40; i++) {
+      fetch_time[i] = 0;
+      setting_time[i] = 0;
+      brg_time[i] = 0;
+      count_num[i] = 0;
+      hw_count_num[i] = 0;
+    }
+
+  }
+  double fetch_time[40];
+  double setting_time[40];
+  double brg_time[40];
+  int64_t count_num[40];
+  int64_t hw_count_num[40];
+};
+
+static time_hepler timer;
+
+
+void print_time() {
+  double fetch_time = 0, setting_time=0, brg_time=0;
+  int thread_count = 0;
+  int hw_num = 0;
+  int lastinx = 0;
+  for (int i = 0; i < 40; i ++) {
+    if (timer.count_num[i]>0) {
+      lastinx = i;
+      thread_count += timer.count_num[i];
+      fetch_time += timer.fetch_time[i];
+      setting_time += timer.setting_time[i];
+      brg_time += timer.brg_time[i];
+      hw_num += timer.hw_count_num[i];
+    }
+  }
+
+  std::cout << "fetch_time: " << (fetch_time / thread_count) << "ns\n";
+  std::cout << "setting_time: " << (setting_time / thread_count) << "ns\n";
+  std::cout << "brg_time: " << (brg_time / thread_count) << "ns\n";
+  std::cout << "brgemm num: " << (thread_count) << "\n";
+  std::cout << "hw_num: " << (hw_num) << "\n";
+  std::cout << "count_num[0]: " << (timer.count_num[0]) << " count_num[lastinx]: " << (timer.count_num[lastinx]) << "\n";
+  for (int i = 0; i < thread_count; i++) {
+    timer.fetch_time[i] = 0;
+    timer.setting_time[i] = 0;
+    timer.brg_time[i] = 0;
+    timer.count_num[i] = 0;
+    timer.hw_count_num[i] = 0;
+  }
+}
 
 namespace at::native::cpublas {
 namespace internal {
@@ -965,11 +1023,16 @@ std::size_t UnsafeUkernelKeyHasher<BrgemmKey>::operator()(const BrgemmKey& key) 
   // Use M, N, K add_C, and ldc to compute hash to reduce the overhead as
   // batch size and data types are unlikely to change within the same kernel and
   // lda/ldb are likely to be related to M, K, N or use fixed values.
+  // std::lock_guard<std::mutex> lock(print_mtx);
   std::size_t h = std::hash<int64_t>()(key.M);
   h = std::hash<int64_t>()(key.N) ^ (h << 1);
   h = std::hash<int64_t>()(key.K) ^ (h << 1);
-  h = std::hash<bool>()(key.add_C) ^ (h << 1);
+  h = std::hash<int64_t>()(key.lda) ^ (h << 1);
+  h = std::hash<int64_t>()(key.ldb) ^ (h << 1);
   h = std::hash<int64_t>()(key.ldc) ^ (h << 1);
+  h = std::hash<bool>()(key.add_C) ^ (h << 1);
+  // std::cout << "hash: " << h << "\n";
+  // std::cout << "M: " << key.M << " N: " << key.N << " K: " << key.K << " lda: " << key.lda << " ldb: " << key.ldb << " ldc: " << key.ldc << " add_C: " << key.add_C << "\n"; 
   return h;
 }
 
@@ -989,11 +1052,20 @@ struct KernelCache  {
   static inline std::shared_ptr<value_t>&& fetch_or_create(
       const key_t& key,
       const std::function<std::shared_ptr<value_t>()>& callback) {
+    // std::lock_guard<std::mutex> lock(print_mtx);
+    // int ompIdx = at::get_thread_num();
+    // timer.count_num[ompIdx] +=1;
+    // auto t1 = std::chrono::high_resolution_clock::now();
     auto&& search = get_store().find(key);
+    // std::cout << "map size: " << get_store().size() << "\n";
     if (search != get_store().end()) {
+      // auto t2 = std::chrono::high_resolution_clock::now();
+      // timer.fetch_time[ompIdx] += std::chrono::duration_cast<res>(t2 - t1).count();
       return std::move(search->second);
     } else {
       get_store().insert({key, callback()});
+      // auto t2 = std::chrono::high_resolution_clock::now();
+      // timer.fetch_time[ompIdx] += std::chrono::duration_cast<res>(t2 - t1).count();
       return std::move(get_store()[key]);
     }
   }
@@ -1003,6 +1075,37 @@ struct KernelCache  {
     return cache_kernels;
   }
 };
+
+// template <typename key_t, typename value_t>
+// struct KernelCache  { // ska::flat_hash_map
+//   using kstore_t = std::unordered_map<key_t, value_t*, UnsafeUkernelKeyHasher<key_t>>;
+//   static inline value_t* fetch_or_create(
+//       const key_t& key,
+//       const std::function<value_t* ()>& callback) {
+//     // std::lock_guard<std::mutex> lock(print_mtx);
+//     // int ompIdx = at::get_thread_num();
+//     // timer.count_num[ompIdx] +=1;
+//     // auto t1 = std::chrono::high_resolution_clock::now();
+//     auto&& search = get_store().find(key);
+//     if (search != get_store().end()) {
+//       // auto t2 = std::chrono::high_resolution_clock::now();
+//       // timer.fetch_time[ompIdx] += std::chrono::duration_cast<res>(t2 - t1).count();
+//       return std::move(search->second);
+//     } else {
+//       get_store().insert({key, callback()});
+//       // auto t2 = std::chrono::high_resolution_clock::now();
+//       // timer.fetch_time[ompIdx] += std::chrono::duration_cast<res>(t2 - t1).count();
+//       return std::move(get_store()[key]);
+//     }
+//   }
+
+//   static inline kstore_t& get_store() {
+//     static thread_local kstore_t cache_kernels;
+//     return cache_kernels;
+//   }
+// };
+
+#endif
 
 // Helper struct for convenient brgemm configuration
 struct GemmHelper {
@@ -1018,7 +1121,9 @@ struct GemmHelper {
       ScalarType dt_b,
       ScalarType dt_c,
       const bool add_C) {
-    // Create brgemm
+// oneDNN BRGEMM
+#if defined(ONEDNN_UKERNEL_ENABLED)
+// Create brgemm
 #if defined(ONEDNN_UKERNEL_1)
     brg = dnnl::ukernel::brgemm(
         M,
@@ -1057,8 +1162,23 @@ struct GemmHelper {
   dnnl::ukernel::brgemm brg;
   std::vector<uint8_t> scratchpad;
   std::vector<std::pair<int64_t, int64_t>> A_B_offsets;
+#else
+TORCH_CHECK(false,
+  "Brgemm is only supported on X64 when oneDNN ukernel is enabled");
+#endif
+
+  void execute(const void * A, const void * B, void * C) {
+#if defined(ONEDNN_UKERNEL_ENABLED)
+    brg.execute(A, B, A_B_offsets, C, scratchpad.data());
+#else
+    TORCH_CHECK(false,
+      "Brgemm is only supported on X64 when oneDNN ukernel is enabled");
+#endif
+  }
 };
 
+// oneDNN BRGEMM
+#if defined(ONEDNN_UKERNEL_ENABLED)
 struct Brgemm : public KernelCache <BrgemmKey, GemmHelper> {
   // Fetch/create GemmHelper object and execute brgemm with batch size = 1
   template <typename scalar_t_a, typename scalar_t_b, typename scalar_t_c>
@@ -1073,6 +1193,9 @@ struct Brgemm : public KernelCache <BrgemmKey, GemmHelper> {
       const scalar_t_a* A,
       const scalar_t_b* B,
       scalar_t_c* C) {
+    // int ompIdx = at::get_thread_num();
+    // timer.count_num[ompIdx] +=1;
+    // auto t1 = std::chrono::high_resolution_clock::now();
     auto&& key = BrgemmKey(
         M,
         N,
@@ -1088,6 +1211,8 @@ struct Brgemm : public KernelCache <BrgemmKey, GemmHelper> {
     // Fetch/create GemmHelper object
     auto&& value = fetch_or_create(key, [&]() {
       auto&& v = std::make_shared<GemmHelper>(
+    // GemmHelper* value = fetch_or_create(key, [&]() {
+    //   GemmHelper* v = new GemmHelper(
           M,
           N,
           K,
@@ -1101,21 +1226,116 @@ struct Brgemm : public KernelCache <BrgemmKey, GemmHelper> {
           add_C);
       (*v).brg.generate();
       return std::move(v);
+      // return v;
     });
+    // auto t2 = std::chrono::high_resolution_clock::now();
+    // timer.fetch_time[ompIdx] += std::chrono::duration_cast<res>(t2 - t1).count();
+    // t1 = std::chrono::high_resolution_clock::now();
     if (get_current() != value) {
+      // timer.hw_count_num[ompIdx] +=1;
+      // std::lock_guard<std::mutex> lock(print_mtx);
+      // printf("set_hw_context call\n");
 #if defined(ONEDNN_UKERNEL_1)
       dnnl::ukernel::brgemm::release_hw_context();
 #endif
       ((*value).brg).set_hw_context();
       get_current() = value;
     }
+    // t2 = std::chrono::high_resolution_clock::now();
+    // timer.setting_time[ompIdx] += std::chrono::duration_cast<res>(t2 - t1).count();
+    
+    // t1 = std::chrono::high_resolution_clock::now();
     ((*value).brg)
         .execute(A, B, (*value).A_B_offsets, C, (*value).scratchpad.data());
+    // t2 = std::chrono::high_resolution_clock::now();
+    // timer.brg_time[ompIdx] += std::chrono::duration_cast<res>(t2 - t1).count();
+    }
+
+  // create and init brgemm
+  static inline GemmHelper* create(
+      int64_t M,
+      int64_t N,
+      int64_t K,
+      int64_t ld_a,
+      int64_t ld_b,
+      int64_t ld_c,
+      const bool add_C,
+      ScalarType dt_a,
+      ScalarType dt_b,
+      ScalarType dt_c) {
+    auto&& key = BrgemmKey(
+        M,
+        N,
+        K,
+        int64_t(1),
+        ld_a,
+        ld_b,
+        ld_c,
+        dt_a,
+        dt_b,
+        dt_c,
+        add_C);
+    // Fetch/create GemmHelper object
+    auto&& value = fetch_or_create(key, [&]() {
+      auto&& v = std::make_shared<GemmHelper>(
+    // GemmHelper* value = fetch_or_create(key, [&]() {
+    //   GemmHelper* v = new GemmHelper(
+          M,
+          N,
+          K,
+          1,
+          ld_a,
+          ld_b,
+          ld_c,
+          dt_a,
+          dt_b,
+          dt_c,
+          add_C);
+      (*v).brg.generate();
+      // return v;
+      return std::move(v);
+    });
+    return value.get();
   }
+
+  // execute brgemm
+  template <typename scalar_t_a, typename scalar_t_b, typename scalar_t_c>
+  static inline void execute(
+    GemmHelper* ghelper,
+    const scalar_t_a* A,
+    const scalar_t_b* B,
+    scalar_t_c* C) {
+    // int ompIdx = at::get_thread_num();
+    // timer.count_num[ompIdx] +=1;
+    // auto t1 = std::chrono::high_resolution_clock::now();
+    if (get_current2() != ghelper) {
+      // timer.hw_count_num[ompIdx] +=1;
+      // std::lock_guard<std::mutex> lock(print_mtx);
+      // printf("set_hw_context execute\n");
+#if defined(ONEDNN_UKERNEL_1)
+      dnnl::ukernel::brgemm::release_hw_context();
+#endif
+      ((*ghelper).brg).set_hw_context();
+      get_current2() = ghelper;
+    }
+    // auto t2 = std::chrono::high_resolution_clock::now();
+    // timer.setting_time[ompIdx] += std::chrono::duration_cast<res>(t2 - t1).count();
+    // t1 = std::chrono::high_resolution_clock::now();
+    ((*ghelper).brg)
+        .execute(A, B, (*ghelper).A_B_offsets, C, (*ghelper).scratchpad.data());
+    // t2 = std::chrono::high_resolution_clock::now();
+    // timer.brg_time[ompIdx] += std::chrono::duration_cast<res>(t2 - t1).count();
+  }
+
 
   static inline std::shared_ptr<GemmHelper>& get_current() {
     static thread_local std::shared_ptr<GemmHelper> current;
     return current;
+  }
+
+  static inline GemmHelper * & get_current2() {
+    static thread_local GemmHelper * current1=nullptr;
+    return current1;
   }
 
   static inline bool device_check(ScalarType dtype) {
@@ -1139,35 +1359,6 @@ using pack_t = dnnl::ukernel::brgemm_pack_B;
 using pack_t = dnnl::ukernel::transform;
 #endif
 struct Pack : public KernelCache <PackKey, pack_t> {
-  static inline void call(
-      int64_t K,
-      int64_t N,
-      int64_t ld_in,
-      int64_t ld_out,
-      ScalarType dt_in,
-      ScalarType dt_out,
-      const void* in,
-      void* out) {
-    auto&& key = PackKey(K, N, ld_in, ld_out, dt_in, dt_out);
-    auto&& pack = fetch_or_create(key, [&]() {
-      auto&& p = std::make_shared<pack_t>(
-#if defined(ONEDNN_UKERNEL_1)
-          K, N, ld_in, ld_out, get_dnnl_dtype(dt_in), get_dnnl_dtype(dt_out));
-#elif defined(ONEDNN_UKERNEL_2)
-          K, N, dnnl::ukernel::pack_type::no_trans, ld_in, ld_out, get_dnnl_dtype(dt_in), get_dnnl_dtype(dt_out));
-#endif
-      if (need_pack(dt_in)) {
-        (*p).generate();
-      }
-      return std::move(p);
-    });
-    if (need_pack(dt_in)) {
-      (*pack).execute(in, out);
-    } else {
-      TORCH_CHECK(false, "No need to pack");
-    }
-  }
-
   static inline bool need_pack(ScalarType dtype) {
     if (!at::globalContext().userEnabledMkldnn()) {
       return false;
@@ -1206,6 +1397,37 @@ void brgemm(
   "Half Brgemm is only supported on X64 when oneDNN ukernel is enabled and avx512_fp16 is supported");
 }
 
+GemmHelper* brgemm_create(
+    int64_t M,
+    int64_t N,
+    int64_t K,
+    int64_t ld_a,
+    int64_t ld_b,
+    int64_t ld_c,
+    const bool add_C,
+    ScalarType dt_a,
+    ScalarType dt_b,
+    ScalarType dt_c) {
+  return Brgemm::create(
+    M, N, K, ld_a, ld_b, ld_c, add_C, dt_a, dt_b, dt_c);
+}
+
+void brgemm_execute(
+  GemmHelper* ghelper,
+  const at::Half* A,
+  const at::Half* B,
+  float* C) {
+#if defined(ONEDNN_UKERNEL_ENABLED)
+  if (Brgemm::device_check(ScalarType::Half)) {
+    Brgemm::execute<at::Half, at::Half, float>(
+      ghelper, A, B, C);
+    return;
+  }
+#endif
+  TORCH_CHECK(false,
+  "Half Brgemm is only supported on X64 when oneDNN ukernel is enabled and avx512_fp16 is supported");
+}
+
 void brgemm(
     int64_t M,
     int64_t N,
@@ -1228,26 +1450,27 @@ void brgemm(
   "BFloat16 Brgemm is only supported on X64 when oneDNN ukernel is enabled and avx512 is supported");
 }
 
+void brgemm_execute(
+  GemmHelper* ghelper,
+  const at::BFloat16* A,
+  const at::BFloat16* B,
+  float* C) {
+#if defined(ONEDNN_UKERNEL_ENABLED)
+  if (Brgemm::device_check(ScalarType::BFloat16)) {
+    Brgemm::execute<at::BFloat16, at::BFloat16, float>(
+      ghelper, A, B, C);
+    return;
+  }
+#endif
+  TORCH_CHECK(false,
+  "BFloat16 Brgemm is only supported on X64 when oneDNN ukernel is enabled and avx512 is supported");
+}
+
 void brgemm_release() {
 #if defined(ONEDNN_UKERNEL_ENABLED)
   dnnl::ukernel::brgemm::release_hw_context();
   Brgemm::get_current() = nullptr;
-#endif
-}
-
-void pack(
-    int64_t K,
-    int64_t N,
-    int64_t ld_in,
-    int64_t ld_out,
-    ScalarType dt_in,
-    ScalarType dt_out,
-    const void* in,
-    void* out) {
-#if defined(ONEDNN_UKERNEL_ENABLED)
-  Pack::call(K, N, ld_in, ld_out, dt_in, dt_out, in, out);
-#else
-  TORCH_CHECK(false, "pack is only supported on X64 with oneDNN ukernel enabled");
+  Brgemm::get_current2() = nullptr;
 #endif
 }
 

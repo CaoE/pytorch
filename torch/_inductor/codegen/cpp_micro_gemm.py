@@ -508,9 +508,12 @@ class CppMicroGemmAMX(CppMicroGemm):
     """
 
     TEMPLATE_ENTRY = r"""
+#include <iostream>
 {{declare_kernel}} {
     {{kernel.assert_function}}(N % {{block_n}} == 0, "N dimension must be multiple of {{block_n}}");
     {{kernel.assert_function}}(K % 2 == 0, "K dimension must be multiple of 2");
+std::cout << "M: " << M << " N: " << N << " K: " << K << std::endl;
+std::cout << "lda: " << lda << " ldb: " << ldb << " ldc: " << ldc << std::endl;
 {%- if use_cached_dequantized_B %}
     // Create a stack-allocated buffer for tiles of B.
     // Except maybe for the tail-case, an AMX tile of B has 16x32 BF16 elements.
@@ -812,10 +815,25 @@ class CppMicroBrgemm(CppMicroGemm):
     This class generates the code for micro gemm using oneDNN brgemm.
     It supports input types of torch.half.
     """
+#     DECLARE_KERNEL = r"""
+# template <bool accum>
+# inline void {{kernel_name}}(
+# {%- if kernel_extra_args_declare %}
+#     {{kernel_extra_args_declare}}
+# {%- endif %}
+#     at::native::cpublas::GemmHelper * brgemm,
+#     const {{input_t}}* {{restrict_keyword}} A,
+#     const {{input2_t}}* {{restrict_keyword}} B,
+#     {{output_t}}* {{restrict_keyword}} C
+# )
+# """
 
     TEMPLATE_ENTRY = r"""
 #include <ATen/native/CPUBlas.h>
+//#include <iostream>
 {{declare_kernel}} {
+    //std::cout << "M: " << M << " N: " << N << " K: " << K << std::endl;
+    //std::cout << "lda: " << lda << " ldb: " << ldb << " ldc: " << ldc << std::endl;
     at::native::cpublas::brgemm(
       M, N, K,
       lda, ldb, ldc,
@@ -823,8 +841,79 @@ class CppMicroBrgemm(CppMicroGemm):
       A,
       B,
       C);
+    //at::native::cpublas::brgemm_execute(
+    //  brgemm,
+    //  A,
+    //  B,
+    //  C);
 }
 """
+
+#     def codegen_init(
+#         self,
+#         kernel: CppTemplateKernel,
+#     ) -> str:
+#         return r"""
+#         auto brgemm1 = at::native::cpublas::brgemm_create(
+#                  64,
+#                  32,
+#                  64,
+#                  64,
+#                  32,
+#                  32,
+#                  false,
+#                  at::ScalarType::Half,
+#                  at::ScalarType::Half,
+#                  at::ScalarType::Float);
+#         auto brgemm2 = at::native::cpublas::brgemm_create(
+#                  64,
+#                  32,
+#                  64,
+#                  64,
+#                  32,
+#                  32,
+#                  true,
+#                  at::ScalarType::Half,
+#                  at::ScalarType::Half,
+#                  at::ScalarType::Float);        
+# """
+
+#     def codegen_call(
+#         self,
+#         kernel: CppTemplateKernel,
+#         A: ir.Buffer,
+#         B: ir.Buffer,
+#         C: ir.Buffer,
+#         accum: bool,
+#     ) -> str:
+#         """
+#         Generate the code for calling the templated kernel that computes
+#         `C += alpha * A @ B` if `accum` is True, or `C = alpha * A @ B` otherwise.
+#         """
+#         A_ptr = f"&({kernel.index(A, [0, 0])})"
+#         B_ptr = f"&({kernel.index(B, [0, 0])})"
+#         C_ptr = f"&({kernel.index(C, [0, 0])})"
+#         M = kernel.size(C, 0)
+#         N = kernel.size(C, 1)
+#         K = kernel.size(A, 1)
+#         lda = kernel.stride(A, 0)
+#         ldb = kernel.stride(B, 0)
+#         ldc = kernel.stride(C, 0)
+#         res = IndentedBuffer()
+#         res.writeline(f"{self.name}<{value_to_cpp(accum, 'bool')}>(")
+#         with res.indent():
+#             extra_args = self.get_kernel_extra_args()
+#             if extra_args:
+#                 res.writeline(extra_args)
+#             if accum:
+#                 res.writeline(f"brgemm2,")
+#             else:
+#                 res.writeline(f"brgemm1,")
+#             res.writeline(f"{A_ptr},")
+#             res.writeline(f"{B_ptr},")
+#             res.writeline(f"{C_ptr}")
+#         res.writeline(");")
+#         return res.getvalue()
 
     def codegen_define(self, kernel: CppTemplateKernel) -> str:
         options = {

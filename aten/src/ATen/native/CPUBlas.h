@@ -7,7 +7,7 @@
 #include <c10/core/ScalarType.h>
 #include <c10/core/Scalar.h>
 
-
+TORCH_API void print_time();
 namespace at::native::cpublas {
 
 namespace internal {
@@ -205,6 +205,34 @@ TORCH_API void brgemm(
     const at::Half* B,
     float* C);
 
+struct GemmHelper;
+
+TORCH_API GemmHelper*
+brgemm_create(
+    int64_t M,
+    int64_t N,
+    int64_t K,
+    int64_t ld_a,
+    int64_t ld_b,
+    int64_t ld_c,
+    const bool add_C,
+    ScalarType dt_a,
+    ScalarType dt_b,
+    ScalarType dt_c);
+
+
+TORCH_API void brgemm_execute(
+  GemmHelper* ghelper,
+  const at::BFloat16* A,
+  const at::BFloat16* B,
+  float* C);
+
+TORCH_API void brgemm_execute(
+  GemmHelper* ghelper,
+  const at::Half* A,
+  const at::Half* B,
+  float* C);
+
 TORCH_API void brgemm(
     int64_t M,
     int64_t N,
@@ -219,17 +247,6 @@ TORCH_API void brgemm(
 
 // Release brgemm hardware context
 TORCH_API void brgemm_release();
-
-// Pack B matrix to get better performance if needed
-void pack(
-    int64_t K,
-    int64_t N,
-    int64_t ld_in,
-    int64_t ld_out,
-    ScalarType dt_in,
-    ScalarType dt_out,
-    const void* in,
-    void* out);
 
 // Whether pack is needed in the platform.
 bool need_pack(ScalarType dt_in);
