@@ -296,6 +296,24 @@ Tensor mkldnn_convolution(
       use_channels_last);
 }
 
+Tensor& mkldnn_convolution_with_out_stride(
+    Tensor& output_t,
+    const Tensor& input_t,
+    const Tensor& weight_t,
+    const std::optional<Tensor>& bias_opt,
+    IntArrayRef padding,
+    IntArrayRef stride,
+    IntArrayRef dilation,
+    IntArrayRef out_strides,
+    int64_t groups,
+    c10::string_view attr,
+    torch::List<std::optional<at::Scalar>> scalars,
+    std::optional<c10::string_view> algorithm) {
+  bool use_channels_last = mkldnn_conv_use_channels_last(input_t, weight_t);
+  std::cout << "mkldnn_convolution_with_out_stride\n";
+  return output_t;
+}
+
 Tensor mkldnn_convolution_pointwise(
     const Tensor& input_t,
     const Tensor& weight_t,
@@ -1058,6 +1076,9 @@ TORCH_LIBRARY_IMPL(mkldnn, CPU, m) {
   m.impl(
       TORCH_SELECTIVE_NAME("mkldnn::_convolution_transpose_pointwise"),
       TORCH_FN(mkldnn_convolution_transpose_pointwise));
+  m.impl(
+      TORCH_SELECTIVE_NAME("mkldnn::mkldnn_convolution_with_out_stride"),
+      TORCH_FN(mkldnn_convolution_with_out_stride));
 }
 
 TORCH_LIBRARY_IMPL(mkldnn, MkldnnCPU, m) {
@@ -1073,6 +1094,9 @@ TORCH_LIBRARY_IMPL(mkldnn, MkldnnCPU, m) {
   m.impl(
       TORCH_SELECTIVE_NAME("mkldnn::_convolution_transpose_pointwise"),
       TORCH_FN(mkldnn_convolution_transpose_pointwise));
+  m.impl(
+      TORCH_SELECTIVE_NAME("mkldnn::mkldnn_convolution_with_out_stride"),
+      TORCH_FN(mkldnn_convolution_with_out_stride));
 }
 
 TORCH_LIBRARY_IMPL(mkldnn, Meta, m) {

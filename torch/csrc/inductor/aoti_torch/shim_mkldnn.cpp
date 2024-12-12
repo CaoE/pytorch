@@ -69,6 +69,48 @@ AOTITorchError aoti_torch_cpu_mkldnn__convolution_pointwise_binary(
   });
 }
 
+AOTITorchError aoti_torch_cpu_mkldnn_convolution_with_out_stride(
+    AtenTensorHandle output,
+    AtenTensorHandle X,
+    AtenTensorHandle W,
+    AtenTensorHandle* B,
+    const int64_t* padding,
+    int64_t padding_len_,
+    const int64_t* stride,
+    int64_t stride_len_,
+    const int64_t* dilation,
+    int64_t dilation_len_,
+    const int64_t* out_strides,
+    int64_t out_strides_len_,
+    int64_t groups,
+    const char* attr,
+    const double** scalars,
+    int64_t scalars_len_,
+    const char** algorithm,
+    AtenTensorHandle* ret0) {
+  AOTI_TORCH_CONVERT_EXCEPTION_TO_ERROR_CODE({
+    c10::List<std::optional<c10::Scalar>> scalars_list;
+    scalars_list.reserve(scalars_len_);
+    for (int64_t i = 0; i < scalars_len_; i++) {
+      scalars_list.emplace_back(pointer_to_optional(scalars[i]));
+    }
+    auto tmp_result = at::native::mkldnn_convolution_with_out_stride(
+        *tensor_handle_to_tensor_pointer(output),
+        *tensor_handle_to_tensor_pointer(X),
+        *tensor_handle_to_tensor_pointer(W),
+        pointer_to_optional<at::Tensor>(B),
+        pointer_to_list<int64_t>(padding, padding_len_),
+        pointer_to_list<int64_t>(stride, stride_len_),
+        pointer_to_list<int64_t>(dilation, dilation_len_),
+        pointer_to_list<int64_t>(out_strides, out_strides_len_),
+        groups,
+        attr,
+        scalars_list,
+        pointer_to_optional<std::string_view>(algorithm));
+    *ret0 = new_tensor_handle(std::move(tmp_result));
+  });
+}
+
 AOTITorchError aoti_torch_cpu_mkldnn__convolution_pointwise_binary_(
     AtenTensorHandle other,
     AtenTensorHandle X,

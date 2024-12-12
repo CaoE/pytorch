@@ -1273,7 +1273,8 @@ class halide:
 # create a directory containing lots of debug information
 class trace:
     # master switch for all debugging flags below
-    enabled = os.environ.get("TORCH_COMPILE_DEBUG", "0") == "1"
+    # enabled = os.environ.get("TORCH_COMPILE_DEBUG", "0") == "1"
+    enabled = True
 
     # save real tensors
     save_real_tensors = os.environ.get("TORCH_COMPILE_DEBUG_SAVE_REAL", "0") == "1"

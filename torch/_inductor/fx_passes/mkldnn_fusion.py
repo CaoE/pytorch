@@ -7,26 +7,32 @@ from typing import Any, Tuple
 import torch
 from torch._dynamo.utils import counters
 from torch.fx.experimental.symbolic_shapes import has_free_symbols
-
+import copy
 from .. import ir
 from ..lowering import lowerings as L
+from ..lowering import empty_strided
 from ..pattern_matcher import (
     Arg,
+    Ignored,
     CallFunction,
     filter_nodes,
     get_arg_value,
     KeywordArg,
+    ListOf,
     MULTIPLE,
 )
 from ..virtualized import ops, V
-from .freezing_patterns import register_freezing_graph_pattern
+from .freezing_patterns import register_freezing_graph_pattern, register_concat_folding_pattern
 from .post_grad import register_lowering_pattern
 from .quantization import (
     _register_quantization_lowerings,
     _register_quantization_weight_pack_pass,
     _register_woq_lowerings,
 )
-
+from torch._prims_common import (
+    make_channels_last_strides_for,
+)
+from ..utils import pad_listlike
 
 if torch._C._has_mkldnn:
     aten = torch.ops.aten
@@ -40,6 +46,19 @@ if torch._C._has_mkldnn:
     def _conv_call(users=1):
         return CallFunction(
             mkldnn._convolution_pointwise.default, *_conv_args, _users=users
+        )
+
+    def _relu_fusion(computation_call, users=1):
+        return CallFunction(aten.relu, computation_call, _users=users)
+
+    def _conv_cat_call(conv_call, users=1):
+        return CallFunction(
+            aten.cat.default,
+            ListOf(
+                conv_call,
+            ),
+            KeywordArg("dim"),
+            _users=users
         )
 
     def _linear_call(users=1):
@@ -237,13 +256,226 @@ if torch._C._has_mkldnn:
 
         return fn
 
+    def _is_valid_conv_concat_fusion(computation_op, lowp_dtype=None):
+        def fn(match):
+            cat_node = match.output_node()
+            assert cat_node.target == aten.cat.default
+
+            # matched = _is_single_computation_op(computation_op, lowp_dtype)(match)
+            # computation_node = filter_nodes(match.nodes, computation_op)[0]
+            # graph = match.graph
+            # for node in computation_node.users:
+            #     print("node: ", node)
+            #     if node.target == aten.cat.default:
+            #         all_conv = True
+            #         for arg_node in node.args:
+            #             if arg_node.target != mkldnn._convolution_pointwise.default:
+            #                 all_conv = False
+            #         return len(node.args) > 0 and all_conv
+            #     else:
+            #         return False
+
+
+            
+
+            # if lowp_dtype:
+            #     conversion_dtype_nodes = filter_nodes(
+            #         match.nodes, prims.convert_element_type.default
+            #     )
+            #     if len(conversion_dtype_nodes) != 2:
+            #         return False
+            #     # fusion pattern is always in the form of computation_op + to_float32 + unary_op + to_bfloat16
+            #     if computation_node == conversion_dtype_nodes[0].args[0]:
+            #         to_float = conversion_dtype_nodes[0].args[1]
+            #         to_lp = conversion_dtype_nodes[1].args[1]
+            #     else:
+            #         to_float = conversion_dtype_nodes[1].args[1]
+            #         to_lp = conversion_dtype_nodes[0].args[1]
+            #     matched = matched and to_float == torch.float and to_lp == lowp_dtype
+            # return matched
+
+        return fn
+
+    # reuse pattern of mkldnn fusion, i.e, mkldnn fusion + concat 
+    def _register_conv_concat_fusion_lowering(
+            pattern, unary_attr, computation_op, lowp_dtype=None
+    ):
+        # new_pattern = CallFunction(aten.cat, ListOf(Arg(),), Ignored(), _users=1) # ListOf(pattern)
+        conv_cat_call = _conv_cat_call(pattern)#_conv_cat_call(_silu_fusion(_conv_call(2)))#_conv_cat_call(_conv_call())
+        # conv_call = (_conv_call(users=2))
+        # # conv_cat_call=_conv_cat_call(_silu_fusion(conv_call))
+        # conv_cat_call = _silu_fusion(conv_call)
+        # conv_cat_call = _conv_cat_call(conv_cat_call)
+        def comp_conv_out_size(x, w, b, padding, stride,
+            dilation,
+            groups,
+            attr,
+            scalars,
+            algorithm,
+            ):
+            with V.graph.fake_mode:
+                x_fake = ir.ir_node_to_tensor(x, guard_shape=True)
+                weight_fake = ir.ir_node_to_tensor(w, guard_shape=True)
+                dims = len(x_fake.size()) - 2
+                assert 0 < len(padding) <= dims
+                assert 0 < len(dilation) <= dims
+                assert 0 < len(stride) <= dims
+                padding = pad_listlike(padding, dims)
+                dilation = pad_listlike(dilation, dims)
+                stride = pad_listlike(stride, dims)
+                transposed=False
+                bias_fake = (
+                    ir.ir_node_to_tensor(b, guard_shape=True) if b is not None else b
+                )
+                output_padding = pad_listlike([0], dims)
+                output = torch.ops.aten.convolution(
+                    x_fake,
+                    weight_fake,
+                    bias_fake,
+                    stride,
+                    padding,
+                    dilation,
+                    transposed,
+                    output_padding,
+                    groups,
+                )
+                return list(output.size())
+
+        @register_lowering_pattern(
+            conv_cat_call,
+            # extra_check=_is_valid_conv_concat_fusion(computation_op, lowp_dtype),
+            pass_number=0,
+        )
+        def fn(match, *args, **kwargs):
+            # 1: compute cat output size
+            # 2: create create cat kernel
+            # 3: create conv with output strides
+            computation_op=mkldnn.mkldnn_convolution_with_out_stride
+            dim = kwargs["dim"]
+            conv_out_size = comp_conv_out_size(*(args[0][0]))
+            conv_out_buf_size = copy.deepcopy(conv_out_size)
+            cat_out_size = conv_out_size#list(args[0][0].get_size())#(8, 16, 30, 30)
+            
+            device = args[0][0][0].get_device()
+            dtype = args[0][0][0].get_dtype()
+            
+            # compute_op = mkldnn._convolution_pointwise.default
+            offsets_start = [0]
+            offsets_end = [cat_out_size[dim]]
+
+            for i in range(1, len(args[0])):
+                input_size = conv_out_size
+                offsets_start.append(cat_out_size[dim])
+                assert len(input_size) == len(cat_out_size)
+                # assert args[0][i].get_dtype() == dtype
+                # assert args[0][i].get_device() == device
+                for j in range(len(cat_out_size)):
+                    if j == dim:
+                        cat_out_size[j] = cat_out_size[j] + input_size[j]
+                    else:
+                        cat_out_size[j] = V.graph.sizevars.guard_equals(
+                            cat_out_size[j], input_size[j]
+                        )
+                offsets_end.append(cat_out_size[dim])
+            conv_out_strides = make_channels_last_strides_for(cat_out_size)
+            # data = ir.OperationBuffer(
+            #     name=None,
+            #     layout=ir.FixedLayout(
+            #         device=device,
+            #         dtype=dtype,
+            #         size=cat_out_size,
+            #         stride=conv_out_strides,
+            #     ),
+            #     # inputs=[],
+            # )
+            # data.name = V.graph.register_buffer(data)
+            # concat_kernel = ir.ComputedBuffer(
+            #     name=None,
+            #     layout=ir.FixedLayout(
+            #         device=data.get_device(),
+            #         dtype=data.get_dtype(),
+            #         size=data.get_size(),
+            #     ),
+            #     data=data,
+            # )
+            concat_kernel = ir.ConcatKernel(
+                name=None,
+                layout=ir.FixedLayout(
+                    device=device,
+                    dtype=dtype,
+                    size=cat_out_size,
+                    stride=conv_out_strides,
+                ),
+                inputs=[],
+            )
+            concat_kernel.name = V.graph.register_buffer(concat_kernel)
+            kernel = ir.StorageBox(concat_kernel)
+            for i in range(len(args[0])):
+                # conv_out_buf_stride = make_channels_last_strides_for(conv_out_buf_size)
+                # conv_out_buf = empty_strided(conv_out_buf_size, conv_out_buf_stride, dtype=dtype, device=device)
+                input_buffer = ir.SliceView.create(
+                    kernel, dim, offsets_start[i], offsets_end[i], clamp=False
+                )
+                # conv_out_buf.data.data.layout = ir.NonOwningLayout(input_buffer)
+                # input_buffer.realize()
+                # input_buffer.name = V.graph.register_buffer(input_buffer)
+                # concat_kernel.inputs.append(input_buffer)
+                computation_args = list(args[0][i])[:-3] + [
+                    unary_attr.op_name,
+                    unary_attr.scalars_attr,
+                    unary_attr.algorithm_attr,
+                ]
+                computation_args.insert(6, conv_out_strides)
+                computation_args.insert(0, input_buffer)
+                L[computation_op](*computation_args)
+            # concat_kernel.inputs = ir.InputsKernel.unwrap_storage(concat_kernel.inputs)
+            V.graph.register_operation(concat_kernel)
+
+            return ir.TensorBox(kernel)
+            # out = L[emp](size)
+            # output_stride = (14400, 900, 30, 1)
+            # offset = 57600
+            # dim = 0
+            # len_dim = size[dim]
+            # graph = match.graph
+            # for node in graph.nodes:
+            #     if node.target == aten.cat.default:
+            #         empty_node = graph.call_function(aten.empty, node.args)
+            #         for i, arg_node in enumerate(node.args[0]):
+            #             print("arg_node.target: ", arg_node.target)
+            #             for i, arg_node2 in enumerate(arg_node.args):
+            #                 print("arg_node2.target: ", arg_node2.target)
+            #                 if arg_node2.target == aten.convolution.default:
+            #                     print("--------arg_node2---------: ", arg_node2)
+            #                     computation_args = list(node.args)[:-3] + [
+            #                         empty_node,
+            #                         output_stride,
+            #                         i * offset
+            #                     ]
+            #                     # computation_args[-2] = aten.as_strided(out, small_size, offset=i * offset)
+            #                     conv_out_node = graph.call_function(mkldnn.mkldnn_convolution_with_out_stride, computation_args)
+            #                     node.replace_all_uses_with(conv_out_node)
+            #                     conv_out_node.meta.update(node.meta)
+            #                     graph.erase_node(node)
+            #     node.replace_all_uses_with(empty_node)
+            #     empty_node.meta.update(node.meta)
+            #     graph.erase_node(node)
+            # print(graph)
+            # exit()
+            # output_stride = ()
+            # out =  L[computation_op](*computation_args)
+            # return out
+            # return L[computation_op](*computation_args)
+
+        return fn
+
     def _register_unary_fusion_lowering(
         pattern, unary_attr, computation_op, lowp_dtype=None
     ):
-        @register_lowering_pattern(
-            pattern,
-            extra_check=_is_valid_computation_unary_fusion(computation_op, lowp_dtype),
-        )
+        # @register_lowering_pattern(
+        #     pattern,
+        #     extra_check=_is_valid_computation_unary_fusion(computation_op, lowp_dtype),
+        # )
         def fn(match, *args, **kwargs):
             computation_args = list(args)[:-3] + [
                 unary_attr.op_name,
@@ -523,10 +755,62 @@ if torch._C._has_mkldnn:
         if isinstance(_other.data, ir.View):
             return _can_be_inplace(_other.data)
         else:
-            return not (
+            a =  not (
                 isinstance(_other.data, ir.ReinterpretView)
                 or len(_other.get_inputs_that_alias_output()) > 0
             )
+            print("------------------- a: ", a)
+            return a
+
+    def _register_unary_maybe_concat_fusion_lowering(
+        pattern,
+        conv_out_op,
+    ):
+        @register_lowering_pattern(
+            pattern,
+            # extra_check=_is_valid_conv_concat_fusion(
+            #     conv_out_op
+            # ),
+            # pass_number=0
+        )
+        def fn(match, *args, **kwargs):
+            args_list = list(args)
+            # computation_args = [args_list[0], other] + args_list[1:-3] + [binary_attr]
+            # computation_args = args_list
+            # return L[conv_out_op](*computation_args)
+        #     device= args_list[1].get_device()
+        #     dtype = args_list[1].get_dtype()
+        #     new_size = list(inputs[0].get_size())
+        #     offsets_start = [0]
+        #     offsets_end = [new_size[dim]]
+        #     assert 0 <= dim < len(new_size)
+        #     for i in range(1, len(inputs)):
+        #         input_size = inputs[i].get_size()
+        #         offsets_start.append(new_size[dim])
+        #         assert len(input_size) == len(new_size)
+        #         assert inputs[i].get_dtype() == dtype
+        #         assert inputs[i].get_device() == device
+        #         for j in range(len(new_size)):
+        #             if j == dim:
+        #                 new_size[j] = new_size[j] + input_size[j]
+        #             else:
+        #                 new_size[j] = V.graph.sizevars.guard_equals(
+        #                     new_size[j], input_size[j]
+        #                 )
+        #         offsets_end.append(new_size[dim])
+        #     concat_kernel = ir.ConcatKernel(
+        #     name=None,
+        #     layout=ir.FixedLayout(
+        #         device=device,
+        #         dtype=dtype,
+        #         size=new_size,
+        #         stride=output_stride,
+        #     ),
+        #     inputs=[],
+        # )
+        # kernel = StorageBox(concat_kernel)
+
+        return fn
 
     def _register_binary_unary_maybe_inplace_fusion_lowering(
         pattern,
@@ -657,6 +941,43 @@ if torch._C._has_mkldnn:
             ]
             for pattern, computation_op in zip(hardtanh_patterns, computation_ops):
                 _register_hardtanh_fusion_lowering(pattern, computation_op, lowp_dtype)
+
+        for lowp_dtype in [torch.bfloat16, torch.float16, None]:
+            replace_patterns = _unary_fusion_patterns(lowp_dtype)
+            for unary_attr, patterns in replace_patterns.items():
+                _register_conv_concat_fusion_lowering(
+                    patterns[0], unary_attr, computation_ops[0], lowp_dtype
+                )
+
+    def _register_conv_out_stride_fusion():
+        fusion_op = mkldnn.mkldnn_convolution_with_out_stride
+        conv_cat_call = _conv_cat_call(_conv_call())
+        _register_unary_maybe_concat_fusion_lowering(
+            conv_cat_call,
+            fusion_op,
+        )
+
+    def _register_binary_fusion():
+        binary_ops = [aten.add, ops.add, aten.sub, ops.sub]
+        fusion_ops = [
+            mkldnn._convolution_pointwise.binary,
+            mkldnn._linear_pointwise.binary,
+        ]
+        _computation_user_1 = [_conv_call(users=1), _linear_call(users=1)]
+        for computation_call, computation_op, fusion_op in zip(
+            _computation_user_1, computation_ops[:-1], fusion_ops
+        ):
+            for binary_op in binary_ops:
+                pattern = _binary_fusion_v2(computation_call, binary_op)
+                _register_binary_unary_fusion_lowering(
+                    pattern, computation_op, binary_op, fusion_op
+                )
+
+            for binary_op in [aten.add, ops.add]:
+                pattern = _binary_fusion_v1(computation_call, binary_op)
+                _register_binary_unary_fusion_lowering(
+                    pattern, computation_op, binary_op, fusion_op
+                )
 
     def _register_inplace_fusion():
         binary_ops = [aten.add, ops.add]
@@ -1312,9 +1633,13 @@ if torch._C._has_mkldnn:
             _register_unary_fusion()
             _register_inplace_fusion()
             _register_binary_unary_fusion()
+            # _register_conv_out_stride_fusion()
             _register_binary_fusion()
+            # print("_mkldnn_fusion_init")
+            # _register_conv_concat_fusion()
             _register_quantization_lowerings()
             _register_woq_lowerings()
+            print("_mkldnn_fusion_init")
 
     @functools.lru_cache(None)
     def _mkldnn_weight_pack_init():

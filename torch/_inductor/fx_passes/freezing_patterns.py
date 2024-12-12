@@ -116,6 +116,13 @@ def register_binary_folding_pattern(pattern, extra_check=_return_true):
         pass_dict=binary_folding_pass,
     )
 
+def register_concat_folding_pattern(pattern, extra_check=_return_true, pass_number=1):
+    return register_graph_pattern(
+        pattern,
+        extra_check=extra_check,
+        pass_dict=pass_patterns[pass_number],
+    )
+
 
 @functools.lru_cache(None)
 def addmm_patterns_init():

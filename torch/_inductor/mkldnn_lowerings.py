@@ -66,6 +66,38 @@ def register_onednn_fusion_ops():
             torch.ops.onednn.qconv2d_pointwise,
         ]
 
+        @register_lowering(torch.ops.mkldnn.mkldnn_convolution_with_out_stride)
+        def convolution_out_strides(
+            y: TensorBox,
+            x: TensorBox,
+            weight: TensorBox,
+            bias: TensorBox,
+            padding,
+            stride,
+            dilation,
+            out_strides,
+            groups,
+            attr,
+            scalars,
+            algorithm,
+        ):
+            return TensorBox.create(
+                mkldnn_ir.ConvolutionOutStrides.create(
+                    y,
+                    x,
+                    weight,
+                    bias,
+                    padding,
+                    stride,
+                    dilation,
+                    out_strides,
+                    groups,
+                    attr,
+                    scalars,
+                    algorithm,
+                )
+            )
+
         @register_lowering(torch.ops.mkldnn._convolution_pointwise)
         def convolution_unary(
             x: TensorBox,
@@ -202,17 +234,17 @@ def register_onednn_fusion_ops():
                         [x, w] if b is None else [x, w, b],
                         **kwargs,  # type: ignore[arg-type]
                     )
-            if len(choices) == 0 or use_aten_gemm_kernels():
-                kwargs = dict(attr=attr, scalars=scalars, algorithm=algorithm)
-                if b is None:
-                    kwargs["B"] = None
-                choices.append(
-                    aten_mkldnn_linear_unary.bind(
-                        [x, w] if b is None else [x, w, b],
-                        layout,
-                        **kwargs,
-                    )
-                )
+            # if len(choices) == 0 or use_aten_gemm_kernels():
+            #     kwargs = dict(attr=attr, scalars=scalars, algorithm=algorithm)
+            #     if b is None:
+            #         kwargs["B"] = None
+            #     choices.append(
+            #         aten_mkldnn_linear_unary.bind(
+            #             [x, w] if b is None else [x, w, b],
+            #             layout,
+            #             **kwargs,
+            #         )
+            #     )
             assert w.get_name() in V.graph.constants
             input_gen_fns = {
                 1: lambda x: V.graph.constants[x.get_name()],

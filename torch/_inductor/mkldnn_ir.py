@@ -471,6 +471,81 @@ class ConvolutionBinaryInplace(ExternKernelAlloc):
         return packed.inputs[0]
 
 
+class ConvolutionOutStrides(ExternKernelAlloc):
+    def __init__(
+        self,
+        kernel_layout,
+        inputs,
+        constant_args=(),
+    ) -> None:
+        # Due to constrain of op.call, other (Tensor&) should be at input[0]
+        # reordered_inputs = [inputs[1], inputs[0]] + inputs[2:]
+        reordered_inputs = inputs
+
+        super().__init__(
+            kernel_layout,
+            reordered_inputs,
+            constant_args,
+            None,
+            op_overload=torch.ops.mkldnn.mkldnn_convolution_with_out_stride,
+            cpp_kernel_name="aoti_torch_cpu_mkldnn_convolution_with_out_stride",
+        )
+
+        self.mutation_outputs = [
+            MutationOutput(NoneLayout(device=inputs[0].get_device()), inputs[0], self),
+        ]
+
+    def codegen(self, wrapper):
+        wrapper.include_extra_header("torch/csrc/inductor/aoti_torch/c/shim_mkldnn.h")
+        super().codegen(wrapper)
+
+    def get_unbacked_symbol_defs(self) -> OrderedSet[sympy.Symbol]:
+        return OrderedSet()
+
+    @classmethod
+    def create(
+        cls,
+        output: "TensorBox",
+        x: "TensorBox",
+        weight: "TensorBox",
+        bias: "TensorBox",
+        padding_: List[int],
+        stride_: List[int],
+        dilation_: List[int],
+        out_strides: List[int],
+        groups: int,
+        attr: Optional[str],
+        scalars: Optional[List[Any]],
+        algorithm: Optional[str],
+    ):
+        (
+            inputs,
+            constant_args,
+            _,
+            req_stride_order,
+            _,
+        ) = _prepare_convolution_fusion_create(
+            cls, x, weight, bias, padding_, stride_, dilation_, groups
+        )
+        output = cls.require_stride_order(output, req_stride_order)
+        inputs.insert(0, output)
+        constant_args = constant_args + [
+            attr,
+            may_convert_to_optional(scalars),
+            algorithm,
+        ]
+        constant_args.insert(3, out_strides)
+        packed = ConvolutionOutStrides(
+            kernel_layout=NoneLayout(device=inputs[1].get_device()),  # type: ignore[arg-type]
+            inputs=inputs,
+            constant_args=constant_args,
+        )
+        # This op mutates in place which means that the result is not the
+        # target but rather the input that is being mutated
+        # init reorders the inputs, so inputs[1] becomes packed.inputs[0]
+        return packed.inputs[0]
+
+
 class ConvolutionTransposeUnary(ExternKernelAlloc):
     def __init__(
         self,

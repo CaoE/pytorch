@@ -791,14 +791,14 @@ class ListOf(PatternExpr):
         m = Match(ctx, self)
         # Propagating patterns with multiple users will ensure we don't revisit
         # the same nodes
-        pattern_to_node = ctx.filter_multi_user_patterns()
+        # pattern_to_node = ctx.filter_multi_user_patterns()
         matched = False
         for i, child_node in enumerate(node):
             child_ctx = MatchContext(
-                ctx.outputs, pattern_to_node, graph=child_node.graph
+                ctx.outputs, graph=child_node.graph
             )
             child_match = child_ctx.match(self.pattern, child_node)
-            pattern_to_node = child_ctx.filter_multi_user_patterns()
+            # pattern_to_node = child_ctx.filter_multi_user_patterns()
             if not is_match(child_match):
                 if not self.partial:
                     return FailedMatch("list[{}]: {}", i, child_match)

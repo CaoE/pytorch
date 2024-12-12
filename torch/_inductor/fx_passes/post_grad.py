@@ -76,14 +76,14 @@ def post_grad_passes(gm: torch.fx.GraphModule, is_inference: bool):
         torch.fx.passes.graph_transform_observer.GraphTransformObserver,
         subsystem="post_grad_passes",
     )
-
+    print("-----gm.graph: ", gm.graph)
     if not torch._dynamo.config.skip_fsdp_hooks:
         remove_fsdp2_unsharded_param_graph_input_usage(gm.graph)
-
+    print("=====gm.graph: ", gm.graph)
     if config.dce:
         # has some issues with mutation in inference mode
         gm.graph.eliminate_dead_code()
-
+        print("eliminate_dead_code gm.graph: ", gm.graph)
     if is_inference and config.reorder_for_locality:
         GraphTransformObserver(gm, "reorder_for_locality").apply_graph_pass(
             reorder_for_locality
@@ -177,6 +177,8 @@ def lazy_init():
         from .mkldnn_fusion import _mkldnn_fusion_init
 
         _mkldnn_fusion_init()
+        # from .fuse_conv_concat import _cat_init
+        # _cat_init()
 
 
 def reorder_for_locality(graph: torch.fx.Graph):
