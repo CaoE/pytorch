@@ -60,7 +60,8 @@ inline void {{kernel_name}}(
     int64_t K,
     int64_t lda,
     int64_t ldb,
-    int64_t ldc
+    int64_t ldc,
+    bool trans_b
 )
 """
 
@@ -127,19 +128,23 @@ inline void {{kernel_name}}(
         B: ir.Buffer,
         C: ir.Buffer,
         accum: bool,
+        trans_b: bool = True
     ) -> str:
         """
         Generate the code for calling the templated kernel that computes
         `C += alpha * A @ B` if `accum` is True, or `C = alpha * A @ B` otherwise.
         """
         A_ptr = f"&({kernel.index(A, [0, 0])})"
-        B_ptr = f"&({kernel.index(B, [0, 0])})"
+        # B_ptr = f"&({kernel.index(B, [0, 0])})"
+        B_ptr = f"&(W[static_cast<int64_t>(k_start + 16384L*nci)])"
         C_ptr = f"&({kernel.index(C, [0, 0])})"
         M = kernel.size(C, 0)
         N = kernel.size(C, 1)
         K = kernel.size(A, 1)
         lda = kernel.stride(A, 0)
-        ldb = kernel.stride(B, 0)
+        # ldb = kernel.stride(B, 0)
+        # print("B layout: ", B.get_layout())
+        ldb = 512
         ldc = kernel.stride(C, 0)
         res = IndentedBuffer()
         res.writeline(f"{self.name}<{value_to_cpp(accum, 'bool')}>(")
@@ -155,7 +160,13 @@ inline void {{kernel_name}}(
             res.writeline(f"{K},")
             res.writeline(f"{lda},")
             res.writeline(f"{ldb},")
-            res.writeline(f"{ldc}")
+            if trans_b:
+                res.writeline(f"{ldc},")
+                res.writeline("true")
+            else:
+                res.writeline(f"{ldc},")
+                res.writeline("false")
+
         res.writeline(");")
         return res.getvalue()
 
@@ -339,15 +350,17 @@ class CppMicroGemmFP32Vec(CppMicroGemm):
     for (int64_t m = 0; m < M; m += {{block_m}}) {
         int64_t block_m = std::min<int64_t>(M - m, {{block_m}});
         for (int64_t n = 0; n < N; n += {{block_n}}) {
+            //std::cout << "n: " << n << std::endl;
             if (block_m == {{block_m}}) {
                 {{kernel_name}}_kernel<{{block_m}}, {{block_n}}, accum>(
                     A + m * lda,
-                    B + n,
+                    B + (trans_b ? (n * ldb) : n),
                     C + m * ldc + n,
                     K,
                     lda,
                     ldb,
-                    ldc
+                    ldc,
+                    trans_b
                 );
             } else {
                 switch (block_m) {
@@ -355,12 +368,13 @@ class CppMicroGemmFP32Vec(CppMicroGemm):
                 case {{b}}:
                     {{kernel_name}}_kernel<{{b}}, {{block_n}}, accum>(
                         A + m * lda,
-                        B + n,
+                        B + (trans_b ? (n * ldb) : n),
                         C + m * ldc + n,
                         K,
                         lda,
                         ldb,
-                        ldc
+                        ldc,
+                        trans_b
                     );
                     break;
 {%- endfor %}
@@ -373,7 +387,85 @@ class CppMicroGemmFP32Vec(CppMicroGemm):
 }
 """
 
+# auto reduce = [&](unsigned int l) {
+
+#     const int depth = at::native::utils::CeilLog2(l);
+#     //std::cout << "depth: " << depth << "" << std::endl;
+#     for (int d = 0; d < depth; d++) {
+#         l = d > 0 ? (l >> 1) : l;
+#         //std::cout << "l: " << l << std::endl;
+#         for (int i = 0; i < l; i++) {
+#             int r = l - 1 - i;
+#             if (i < r) {
+#                 vmid[i] = vmid[i] + vmid[r];
+#             } else if (i == r){
+#                 vmid[i - 1] = vmid[i - 1] + vmid[i];
+#             } else {
+#                 break;
+#             }
+#         }
+#     }
+#     auto c = at::vec::vec_reduce_all([](Vectorized& x, Vectorized& y) { return x + y; }, vmid[0]);
+#     return c;
+# };
+
+
+            # const int depth = at::native::utils::CeilLog2(l);
+            # //std::cout << "depth: " << depth << "" << std::endl;
+            # for (int d = 0; d < depth; d++) {
+            #     l = d > 0 ? (l >> 1) : l;
+            #     //std::cout << "l: " << l << std::endl;
+            #     for (int i = 0; i < l; i++) {
+            #         int r = l - 1 - i;
+            #         if (i < r) {
+            #             vmid[i] = vmid[i] + vmid[r];
+            #         } else if (i == r){
+            #             vmid[i - 1] = vmid[i - 1] + vmid[i];
+            #         } else {
+            #             break;
+            #         }
+            #     }
+            # }
+
+# va[0] = vmid[0] + vmid[1];
+#             va[1] = vmid[2] + vmid[3];
+#             va[2] = vmid[4] + vmid[5];
+#             va[3] = vmid[6] + vmid[7];
+#             va[4] = vmid[8] + vmid[9];
+#             va[5] = vmid[10] + vmid[11];
+#             va[6] = vmid[12] + vmid[13];
+#             va[7] = vmid[14] + vmid[15];
+#             va[8] = vmid[16] + vmid[17];
+#             va[9] = vmid[18] + vmid[19];
+#             va[10] = vmid[20] + vmid[21];
+#             va[11] = vmid[22] + vmid[23];
+#             va[12] = vmid[24] + vmid[25];
+#             va[13] = vmid[26] + vmid[27];
+#             va[14] = vmid[28] + vmid[29];
+#             va[15] = vmid[30] + vmid[31];
+
+#             va[16] = va[0] + va[1];
+#             va[17] = va[2] + va[3];
+#             va[18] = va[4] + va[5];
+#             va[19] = va[6] + va[7];
+#             va[20] = va[8] + va[9];
+#             va[21] = va[10] + va[11];
+#             va[22] = va[12] + va[13];
+#             va[23] = va[14] + va[15];
+
+#             va[24] = va[16] + va[17];
+#             va[25] = va[18] + va[19];
+#             va[26] = va[20] + va[21];
+#             va[27] = va[22] + va[23];
+
+#             va[28] = va[24] + va[25];
+#             va[29] = va[26] + va[27];
+#             va[30] = va[28] + va[29];
+
     TEMPLATE_KERNEL = r"""
+
+#include <ATen/native/cpu/moments_utils.h>
+
 template <int64_t BLOCK_M, int64_t BLOCK_N, bool accum>
 inline void {{kernel_name}}_kernel(
     const {{input_t}}* {{restrict_keyword}} A,
@@ -382,69 +474,162 @@ inline void {{kernel_name}}_kernel(
     int64_t K,
     int64_t lda,
     int64_t ldb,
-    int64_t ldc
+    int64_t ldc,
+    bool trans_b = false
 ) {
     using Vectorized = at::vec::Vectorized<{{compute_t}}>;
     using VectorizedIn = at::vec::Vectorized<{{input_t}}>;
     constexpr auto VLEN = Vectorized::size();
-    constexpr auto ROWS = BLOCK_M;
-    constexpr auto COLS = BLOCK_N / VLEN;
+    if (!trans_b) {
+        constexpr auto ROWS = BLOCK_M;
+        constexpr auto COLS = BLOCK_N / VLEN;
 
-    Vectorized va;
-    at::vec::VectorizedN<{{compute_t}}, COLS> vb;
-    at::vec::VectorizedN<{{compute_t}}, ROWS*COLS> vc;
+        Vectorized va;
+        at::vec::VectorizedN<{{compute_t}}, COLS> vb;
+        at::vec::VectorizedN<{{compute_t}}, ROWS*COLS> vc;
 
-    auto loadc = [&](auto i) {
-        if constexpr (accum) {
+        auto loadc = [&](auto i) {
+            if constexpr (accum) {
+                constexpr int row = i / COLS;
+                constexpr int col = i % COLS;
+                vc[i] = Vectorized::loadu(C + row * ldc + col * VLEN);
+            } else {
+                vc[i] = Vectorized(0.0f);
+            }
+        };
+        c10::ForcedUnroll<ROWS * COLS>{}(loadc);
+
+        auto compute = [&, COLS](auto i, int k) {
             constexpr int row = i / COLS;
             constexpr int col = i % COLS;
-            vc[i] = Vectorized::loadu(C + row * ldc + col * VLEN);
-        } else {
-            vc[i] = Vectorized(0.0f);
-        }
-    };
-    c10::ForcedUnroll<ROWS * COLS>{}(loadc);
 
-    auto compute = [&, COLS](auto i, int k) {
-        constexpr int row = i / COLS;
-        constexpr int col = i % COLS;
-
-        if constexpr (col == 0) {
+            if constexpr (col == 0) {
 {%- if alpha != 1 %}
-            va = Vectorized(static_cast<{{compute_t}}>(A[row * lda + k]) * {{alpha}});
+                va = Vectorized(static_cast<{{compute_t}}>(A[row * lda + k]) * {{alpha}});
 {%- else %}
-            va = Vectorized(static_cast<{{compute_t}}>(A[row * lda + k]));
+                va = Vectorized(static_cast<{{compute_t}}>(A[row * lda + k]));
 {%- endif %}
-        }
+            }
 
-        if constexpr (row == 0) {
+            if constexpr (row == 0) {
 {%- if input2_dtype in [torch.bfloat16, torch.float16] %}
-            auto b = VectorizedIn::loadu(B + k * ldb + col * VLEN, VLEN);
-            vb[col] = at::vec::convert<{{compute_t}}>(b);
+                auto b = VectorizedIn::loadu(B + k * ldb + col * VLEN, VLEN);
+                vb[col] = at::vec::convert<{{compute_t}}>(b);
 {%- elif input2_dtype == torch.int8 %}
-            // Convert VLEN int8 elements to int32, and then fp32
-            auto b32 = at::vec::convert_to_int32<int8_t>(B + k * ldb + col * VLEN);
-            vb[col] = at::vec::convert<float>(b32);
+                // Convert VLEN int8 elements to int32, and then fp32
+                auto b32 = at::vec::convert_to_int32<int8_t>(B + k * ldb + col * VLEN);
+                vb[col] = at::vec::convert<float>(b32);
 {%- else %}
-            vb[col] = Vectorized::loadu(B + k * ldb + col * VLEN);
+                vb[col] = Vectorized::loadu(B + k * ldb + col * VLEN);
 {%- endif %}
+            }
+
+            constexpr int idx = row * COLS + col;
+            vc[idx] = at::vec::fmadd(va, vb[col], vc[idx]);
+        };
+
+        for (int k = 0; k < K; ++k) {
+            c10::ForcedUnroll<ROWS * COLS>{}(compute, k);
         }
 
-        constexpr int idx = row * COLS + col;
-        vc[idx] = at::vec::fmadd(va, vb[col], vc[idx]);
-    };
+        // store to C
+        auto storec = [&](auto i) {
+            constexpr int row = i / COLS;
+            constexpr int col = i % COLS;
+            vc[i].store(C + row * ldc + col * VLEN);
+        };
+        c10::ForcedUnroll<ROWS * COLS>{}(storec);
 
-    for (int k = 0; k < K; ++k) {
-        c10::ForcedUnroll<ROWS * COLS>{}(compute, k);
+    } else {
+        // for transpose B case
+        using VectorizedIn2 = at::vec::Vectorized<{{input2_t}}>;
+        VectorizedIn a_in;
+        VectorizedIn b_in;
+        auto zero = Vectorized(0.0f);
+        constexpr int64_t _K = 512 / VLEN;
+        at::vec::VectorizedN<{{compute_t}}, _K> va;
+        at::vec::VectorizedN<{{compute_t}}, BLOCK_N * _K> vb;
+        at::vec::VectorizedN<{{compute_t}}, _K> vmid;
+        auto valpha = Vectorized({{alpha}});
+        auto vaccum = Vectorized(0.0f);
+
+        // B inner profuct: B is transposed
+        // for B, K dim is contiguous.
+        // Note ldb should be ld of N dim for B
+        // read vec alone k
+        // compute c[i][j] and store directly
+
+        auto compute_trans = [&](auto i, int m, int n) {
+            int row = m;
+            int col = n;
+            auto elem = std::min(static_cast<int>(K - i * VLEN), VLEN);
+            if (n == 0) {
+{%- if alpha != 1 %}
+                a_in = VectorizedIn::loadu(A + row * lda + i * VLEN, elem);
+                va[i] = at::vec::convert<{{compute_t}}>(a_in) * valpha;
+{%- else %}
+                a_in = VectorizedIn::loadu(A + row * lda + i * VLEN, elem);
+                va[i] = at::vec::convert<{{compute_t}}>(a_in);
+{%- endif %}
+            }
+
+            if (m == 0) {
+{%- if input2_dtype in [torch.bfloat16, torch.float16] %}
+                b_in = VectorizedIn2::loadu(B + col * ldb + i * VLEN, elem);
+                vb[n * _K + i] = at::vec::convert<{{compute_t}}>(b_in);
+{%- elif input2_dtype == torch.int8 %}
+                // Convert VLEN int8 elements to int32, and then fp32
+                // Note int8 K should be divided by VLEN
+                auto b32 = at::vec::convert_to_int32<int8_t>(B + col * ldb + i * VLEN);
+                vb[n * _K + i] = at::vec::convert<float>(b32);
+{%- else %}
+                vb[n * _K + i] = Vectorized::loadu(B + col * ldb + i * VLEN);
+{%- endif %}
+            }
+
+            vmid[i] = at::vec::fmadd(va[i], vb[n * _K + i], zero);
+            // store to C
+            //if (i == _K - 1) {
+                //for (int j = 0; j < _K; j++) {
+                //    vaccum = vaccum + vmid[i];
+                //}
+                //auto c = at::vec::vec_reduce_all([](Vectorized& x, Vectorized& y) { return x + y; }, vaccum);
+                //*(C + row * ldc + col) = c;
+            //}
+        };
+
+        auto reduce = [&](unsigned int l) {
+
+            const int depth = at::native::utils::CeilLog2(l);
+            //std::cout << "depth: " << depth << "" << std::endl;
+            for (int d = 0; d < depth; d++) {
+                l = d > 0 ? (l >> 1) : l;
+                //std::cout << "l: " << l << std::endl;
+                for (int i = 0; i < l; i++) {
+                    int r = l - 1 - i;
+                    if (i < r) {
+                        vmid[i] = vmid[i] + vmid[r];
+                    } else if (i == r){
+                        vmid[i - 1] = vmid[i - 1] + vmid[i];
+                    } else {
+                        break;
+                    }
+                }
+            }
+
+            auto c = at::vec::vec_reduce_all([](Vectorized& x, Vectorized& y) { return x + y; }, vmid[0]);
+            return c;
+        };
+
+        for (int m = 0; m < BLOCK_M; ++m) {
+            for (int n = 0; n < BLOCK_N; ++n) {
+                c10::ForcedUnroll<_K>{}(compute_trans, m, n);
+                auto c = reduce(_K);
+                *(C + m * ldc + n) = c;
+
+            }
+        }
     }
-
-    // store to C
-    auto storec = [&](auto i) {
-        constexpr int row = i / COLS;
-        constexpr int col = i % COLS;
-        vc[i].store(C + row * ldc + col * VLEN);
-    };
-    c10::ForcedUnroll<ROWS * COLS>{}(storec);
 }
 """
 
@@ -469,6 +654,7 @@ inline void {{kernel_name}}_kernel(
 
 # extra check for CppMicroGemmAMX
 def check_amx_extra(config, m, n, k, alpha, num_threads):
+    return False
     vnni_size = 4 if config.input_dtype == torch.uint8 else 2
     return k % vnni_size == 0 and alpha == 1
 
@@ -508,14 +694,20 @@ class CppMicroGemmAMX(CppMicroGemm):
     """
 
     TEMPLATE_ENTRY = r"""
+#include <iostream>
 {{declare_kernel}} {
     {{kernel.assert_function}}(N % {{block_n}} == 0, "N dimension must be multiple of {{block_n}}");
     {{kernel.assert_function}}(K % 2 == 0, "K dimension must be multiple of 2");
+std::cout << "M: " << M << " N: " << N << " K: " << K << std::endl;
+std::cout << "lda: " << lda << " ldb: " << ldb << " ldc: " << ldc << std::endl;
 {%- if use_cached_dequantized_B %}
     // Create a stack-allocated buffer for tiles of B.
     // Except maybe for the tail-case, an AMX tile of B has 16x32 BF16 elements.
+    const auto num_elements_per_b_tile = 512;
+    const auto last_k_offset = K / {{block_k}} * {{block_k}};
+    const auto tail_k_size = K - last_k_offset;
     // we cache K * {{block_n}} elements of dequantized B
-    const auto buf_size = K * {{block_n}};
+    const auto buf_size = K * {{block_n}} * sizeof({{input_t}});
     {%- if is_msvc_compiler %}
     // MSVC doesn't support stack-allocated dynamic-sized arrays, so using heap memory here.
     std::unique_ptr<{{input_t}}[]> heap_deq_b_buf_ptr(new {{input_t}}[buf_size]);
@@ -528,42 +720,44 @@ class CppMicroGemmAMX(CppMicroGemm):
     alignas(4096) {{input_t}} dequantized_B_buf[buf_size];
     {%- endif %}
 
-    auto load_dequantized_B = [&](int base_idx) {
-        // Load a tile of B & cache it in L1D.
-        {{input2_t}}* base_addr = const_cast<{{input2_t}}*>(B) + base_idx;
-        for (int idx_dq = 0, idx_q = 0; idx_dq < buf_size; idx_q += ldb, idx_dq += {{block_n}}) {
-        {%- for vec_idx in range(0, block_n - 1, 32) %}
-            auto b_int8 = at::vec::Vectorized<int8_t>::loadu(
-                base_addr + idx_q + {{vec_idx}} ,
-                static_cast<int64_t>(32)
+    const auto b_tile_ptr_stride = ldb * {{vnni_size}};
+
+    auto load_B_row = [&]({{input2_t}}* {{restrict_keyword}} src, {{input_t}}* {{restrict_keyword}} dst) {
+        auto b_int8 = at::vec::Vectorized<int8_t>::loadu(src, static_cast<int64_t>(32));
+        auto b_bf16 = at::vec::convert<{{input_t}}>(b_int8);
+        b_bf16.store(dst);
+    };
+
+    auto load_B_tile = [&]({{input2_t}}* B_ptr, int idx, int num_b_rows) {
+        {{input_t}}* base_addr = dequantized_B_buf + idx;
+        {{kernel.unroll_pragma(8)}}
+        for (int i = 0; i < num_b_rows; i++) {
+            load_B_row(
+                B_ptr + i * b_tile_ptr_stride,
+                base_addr + i * 32
             );
-            auto b_bf16 = at::vec::convert<{{input_t}}>(b_int8);
-            b_bf16.store(dequantized_B_buf + idx_dq + {{vec_idx}});
-        {%- endfor %}
-        {%- if (block_n % 32) != 0 %}
-            auto b_int8_tail = at::vec::Vectorized<int8_t>::loadu(
-                base_addr + idx_q + {{block_n - (block_n % 32)}},
-                static_cast<int64_t>({{block_n % 32}})
-            );
-            auto b_bf16_tail = at::vec::convert<{{input_t}}>(b_int8_tail);
-            b_bf16_tail.store(
-                dequantized_B_buf + idx_dq + {{block_n - (block_n % 32)}},
-                static_cast<int64_t>({{block_n % 32}})
-            );
-        {%- endif %}
         }
     };
-{%- endif %}
-// The ldb would not be block_n if N != block_n
-{%- if use_cached_dequantized_B %}
-    const int64_t updated_ldb = {{block_n}};
-{%- else %}
-    const int64_t updated_ldb = ldb;
+    auto load_dequantized_B = [&](int n) {
+        // Load a tile of B & cache it in L1D.
+        {{kernel.unroll_pragma(4)}}
+        for (int k = 0; k < K; k += {{block_k}}) {
+            int num_b_rows = (k < last_k_offset) ? 16 : tail_k_size;
+            {{kernel.unroll_pragma(2)}}
+            for (int tile_col = 0; tile_col <= 1; tile_col++) {
+                load_B_tile(
+                    const_cast<{{input2_t}}*>(B) + n + k * ldb + tile_col * {{16 * vnni_size}},
+                    (k / {{block_k // 2}} + tile_col) * num_elements_per_b_tile,
+                    num_b_rows
+                );
+            }
+        }
+    };
 {%- endif %}
     // TODO(jgong5): loop unroll for M and N
     for (int64_t n = 0; n < N; n += {{block_n}}) {
 {%- if use_cached_dequantized_B %}
-        // Dequantize K * block_n int8 B elements into BF16
+        // Dequantize K * 32 int8 B elements into BF16
         load_dequantized_B(n);
 {%- endif %}
         for (int64_t m = 0; m < M; m += {{block_m}}) {
@@ -585,7 +779,7 @@ class CppMicroGemmAMX(CppMicroGemm):
                     C + m * ldc + n,
                     K,
                     lda,
-                    updated_ldb,
+                    ldb,
                     ldc,
                     16
                 );
@@ -605,7 +799,7 @@ class CppMicroGemmAMX(CppMicroGemm):
                     C + m_tail * ldc + n,
                     K,
                     lda,
-                    updated_ldb,
+                    ldb,
                     ldc,
                     block_m
                 );
@@ -668,6 +862,11 @@ inline void {{kernel_name}}_amx_kernel_{{num_rows}}_{{num_columns}}(
     }
 
     auto compute = [&](int k) {
+{%- if use_cached_dequantized_B %}
+    // base index for dequantized B
+    const auto num_elements_per_b_tile = 512;
+    const auto base_idx_of_deq_B = (k / {{block_k // 2}}) * num_elements_per_b_tile;
+{%- endif %}
 {%- set tile_offset_a = num_rows // 16 * num_columns %}
 {%- set tile_offset_b = tile_offset_a + num_rows // 16 %}
 {%- for tile_row in range(num_rows // 16) %}
@@ -679,7 +878,11 @@ inline void {{kernel_name}}_amx_kernel_{{num_rows}}_{{num_columns}}(
         _tile_stream_loadd({{tile_idx_a}}, A + {{tile_row * 16}} * lda + k, lda * sizeof({{input_t}}));
         {%- endif %}
         {%- if tile_row == 0 %}
+            {%- if use_cached_dequantized_B %}
+        _tile_loadd({{tile_idx_b}}, B + base_idx_of_deq_B + {{tile_col}} * num_elements_per_b_tile, 64);
+            {%- else %}
         _tile_loadd({{tile_idx_b}}, B + k * ldb + {{tile_col * 16 * vnni_size}}, ldb * {{vnni_size}} * sizeof({{input_t}}));
+            {%- endif %}
         {%- endif %}
         {%- if int8_gemm %}
         _tile_dpbusd({{tile_idx_c}}, {{tile_idx_a}}, {{tile_idx_b}});
@@ -798,10 +1001,25 @@ class CppMicroBrgemm(CppMicroGemm):
     This class generates the code for micro gemm using oneDNN brgemm.
     It supports input types of torch.half.
     """
+#     DECLARE_KERNEL = r"""
+# template <bool accum>
+# inline void {{kernel_name}}(
+# {%- if kernel_extra_args_declare %}
+#     {{kernel_extra_args_declare}}
+# {%- endif %}
+#     at::native::cpublas::GemmHelper * brgemm,
+#     const {{input_t}}* {{restrict_keyword}} A,
+#     const {{input2_t}}* {{restrict_keyword}} B,
+#     {{output_t}}* {{restrict_keyword}} C
+# )
+# """
 
     TEMPLATE_ENTRY = r"""
 #include <ATen/native/CPUBlas.h>
+//#include <iostream>
 {{declare_kernel}} {
+    //std::cout << "M: " << M << " N: " << N << " K: " << K << std::endl;
+    //std::cout << "lda: " << lda << " ldb: " << ldb << " ldc: " << ldc << std::endl;
     at::native::cpublas::brgemm(
       M, N, K,
       lda, ldb, ldc,
@@ -809,8 +1027,79 @@ class CppMicroBrgemm(CppMicroGemm):
       A,
       B,
       C);
+    //at::native::cpublas::brgemm_execute(
+    //  brgemm,
+    //  A,
+    //  B,
+    //  C);
 }
 """
+
+#     def codegen_init(
+#         self,
+#         kernel: CppTemplateKernel,
+#     ) -> str:
+#         return r"""
+#         auto brgemm1 = at::native::cpublas::brgemm_create(
+#                  64,
+#                  32,
+#                  64,
+#                  64,
+#                  32,
+#                  32,
+#                  false,
+#                  at::ScalarType::Half,
+#                  at::ScalarType::Half,
+#                  at::ScalarType::Float);
+#         auto brgemm2 = at::native::cpublas::brgemm_create(
+#                  64,
+#                  32,
+#                  64,
+#                  64,
+#                  32,
+#                  32,
+#                  true,
+#                  at::ScalarType::Half,
+#                  at::ScalarType::Half,
+#                  at::ScalarType::Float);        
+# """
+
+#     def codegen_call(
+#         self,
+#         kernel: CppTemplateKernel,
+#         A: ir.Buffer,
+#         B: ir.Buffer,
+#         C: ir.Buffer,
+#         accum: bool,
+#     ) -> str:
+#         """
+#         Generate the code for calling the templated kernel that computes
+#         `C += alpha * A @ B` if `accum` is True, or `C = alpha * A @ B` otherwise.
+#         """
+#         A_ptr = f"&({kernel.index(A, [0, 0])})"
+#         B_ptr = f"&({kernel.index(B, [0, 0])})"
+#         C_ptr = f"&({kernel.index(C, [0, 0])})"
+#         M = kernel.size(C, 0)
+#         N = kernel.size(C, 1)
+#         K = kernel.size(A, 1)
+#         lda = kernel.stride(A, 0)
+#         ldb = kernel.stride(B, 0)
+#         ldc = kernel.stride(C, 0)
+#         res = IndentedBuffer()
+#         res.writeline(f"{self.name}<{value_to_cpp(accum, 'bool')}>(")
+#         with res.indent():
+#             extra_args = self.get_kernel_extra_args()
+#             if extra_args:
+#                 res.writeline(extra_args)
+#             if accum:
+#                 res.writeline(f"brgemm2,")
+#             else:
+#                 res.writeline(f"brgemm1,")
+#             res.writeline(f"{A_ptr},")
+#             res.writeline(f"{B_ptr},")
+#             res.writeline(f"{C_ptr}")
+#         res.writeline(");")
+#         return res.getvalue()
 
     def codegen_define(self, kernel: CppTemplateKernel) -> str:
         options = {

@@ -202,17 +202,17 @@ def register_onednn_fusion_ops():
                         [x, w] if b is None else [x, w, b],
                         **kwargs,  # type: ignore[arg-type]
                     )
-            if len(choices) == 0 or use_aten_gemm_kernels():
-                kwargs = dict(attr=attr, scalars=scalars, algorithm=algorithm)
-                if b is None:
-                    kwargs["B"] = None
-                choices.append(
-                    aten_mkldnn_linear_unary.bind(
-                        [x, w] if b is None else [x, w, b],
-                        layout,
-                        **kwargs,
-                    )
-                )
+            # if len(choices) == 0 or use_aten_gemm_kernels():
+            #     kwargs = dict(attr=attr, scalars=scalars, algorithm=algorithm)
+            #     if b is None:
+            #         kwargs["B"] = None
+            #     choices.append(
+            #         aten_mkldnn_linear_unary.bind(
+            #             [x, w] if b is None else [x, w, b],
+            #             layout,
+            #             **kwargs,
+            #         )
+            #     )
             assert w.get_name() in V.graph.constants
             input_gen_fns = {
                 1: lambda x: V.graph.constants[x.get_name()],

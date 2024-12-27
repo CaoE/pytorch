@@ -63,7 +63,9 @@
        // || defined(__HIP_DEVICE_COMPILE__))
 #endif // __x86_64__ || _M_X64 || __i386 || _M_IX86
 #endif // __GNUC__ || __clang__
-
+#define C10_X86_F16_TEST 1
+#include <immintrin.h>
+#include <emmintrin.h>
 namespace c10 {
 
 namespace detail {
@@ -174,7 +176,7 @@ inline uint32_t fp16_ieee_to_fp32_bits(uint16_t h) {
  * between integer and floating-point variables.
  */
 C10_HOST_DEVICE inline float fp16_ieee_to_fp32_value(uint16_t h) {
-#ifdef C10_X86_F16
+#ifdef C10_X86_F16_TEST
   return _cvtsh_ss(h);
 #else
   /*
@@ -312,7 +314,7 @@ C10_HOST_DEVICE inline float fp16_ieee_to_fp32_value(uint16_t h) {
  * between integer and floating-point variables.
  */
 inline uint16_t fp16_ieee_from_fp32_value(float f) {
-#ifdef C10_X86_F16
+#ifdef C10_X86_F16_TEST
   return _cvtss_sh(f, _MM_FROUND_TO_NEAREST_INT);
 #else
   // const float scale_to_inf = 0x1.0p+112f;
