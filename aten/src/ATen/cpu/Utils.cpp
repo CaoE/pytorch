@@ -8,6 +8,69 @@
 #include <unistd.h>
 #endif
 
+#include <string>
+#include <iostream>
+#include <ATen/Parallel.h>
+
+struct measure {
+  measure(std::string);
+  void update(double);
+  void show();
+  ~measure();
+  int parallel_num;
+  double time[300];
+  double num[300];
+  double final_time = 0;
+  double final_num = 0;
+  std::string pre;
+};
+
+measure::measure(std::string s){
+  parallel_num = at::get_num_threads();
+  pre = s;
+  for (int i = 0; i < 300; i ++) {
+    time[i] = 0;
+    num[i] = 0;
+  }
+}
+
+void measure::update(double t) {
+  int tid = at::get_thread_num();
+  time[tid] += t;
+  num[tid] +=1;
+}
+
+void measure::show() {
+  for (int i = 0; i < parallel_num; i ++) {
+    final_time += time[i];
+    final_num += num[i];
+  }
+  std::cout << pre << " time ms: " <<  (final_time / 1000 / 1000) << std::endl;
+  std::cout << pre << " num: " <<  final_num << std::endl;
+}
+
+measure::~measure() {
+  show();
+}
+
+
+measure& get_bf16_measure() {
+  static measure bf16_measure = measure("bf16 upconversion"); 
+  return bf16_measure;
+}
+
+measure& get_fp16_measure() {
+  static measure fp16_measure = measure("fp16 upconversion"); 
+  return fp16_measure;
+}
+
+void bf16_measure_update(double t) {
+  get_bf16_measure().update(t);
+}
+void fp16_measure_update(double t) {
+  get_fp16_measure().update(t);
+}
+
 namespace at::cpu {
 bool is_avx2_supported() {
 #if !defined(__s390x__) && !defined(__powerpc__)

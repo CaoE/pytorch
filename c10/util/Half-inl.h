@@ -30,6 +30,13 @@ C10_CLANG_DIAGNOSTIC_PUSH()
 C10_CLANG_DIAGNOSTIC_IGNORE("-Wimplicit-int-float-conversion")
 #endif
 
+#include <chrono>
+typedef std::chrono::nanoseconds res;
+
+struct measure;
+void fp16_measure_update(double t);
+measure& get_fp16_measure();
+
 namespace c10 {
 
 #if defined(__aarch64__) && !defined(__CUDACC__)
@@ -64,7 +71,11 @@ inline C10_HOST_DEVICE Half::operator float() const {
   return float(c10::bit_cast<sycl::half>(x));
 #elif (defined(CPU_CAPABILITY_AVX2) || defined(CPU_CAPABILITY_AVX512)) && \
     !defined(__APPLE__)
-  return at::vec::half2float_scalar(x);
+  auto t1 = std::chrono::high_resolution_clock::now();
+  auto r =  at::vec::half2float_scalar(x);
+  auto t2 = std::chrono::high_resolution_clock::now();
+  fp16_measure_update(std::chrono::duration_cast<res>(t2 - t1).count());
+  return r;
 #elif defined(__aarch64__) && !defined(__CUDACC__)
   return detail::native_fp16_to_fp32_value(x);
 #else

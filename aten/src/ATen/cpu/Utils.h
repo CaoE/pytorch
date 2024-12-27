@@ -3,7 +3,8 @@
 #include <cstdint>
 
 #include <c10/macros/Export.h>
-
+TORCH_API void bf16_measure_update(double t);
+TORCH_API void fp16_measure_update(double t);
 namespace at::cpu {
 
 TORCH_API bool is_avx2_supported();

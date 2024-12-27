@@ -19,6 +19,13 @@ C10_CLANG_DIAGNOSTIC_IGNORE("-Wimplicit-int-float-conversion")
 #include <ext/oneapi/bfloat16.hpp>
 #endif
 
+#include <chrono>
+typedef std::chrono::nanoseconds res;
+
+struct measure;
+void bf16_measure_update(double t);
+measure& get_bf16_measure();
+
 namespace c10 {
 
 /// Constructors
@@ -45,7 +52,11 @@ inline C10_HOST_DEVICE BFloat16::operator float() const {
     defined(SYCL_EXT_ONEAPI_BFLOAT16_MATH_FUNCTIONS)
   return float(*reinterpret_cast<const sycl::ext::oneapi::bfloat16*>(&x));
 #else
-  return detail::f32_from_bits(x);
+  auto t1 = std::chrono::high_resolution_clock::now();
+  auto r = detail::f32_from_bits(x);
+  auto t2 = std::chrono::high_resolution_clock::now();
+  bf16_measure_update(std::chrono::duration_cast<res>(t2 - t1).count());
+  return r;
 #endif
 }
 
