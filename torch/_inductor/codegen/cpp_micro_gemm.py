@@ -410,7 +410,7 @@ class CppMicroGemmFP32Vec(CppMicroGemm):
 # };
 
 
-            # const int depth = at::native::utils::CeilLog2(l);
+            # const int depth = 5;//at::native::utils::CeilLog2(l);
             # //std::cout << "depth: " << depth << "" << std::endl;
             # for (int d = 0; d < depth; d++) {
             #     l = d > 0 ? (l >> 1) : l;
@@ -427,7 +427,7 @@ class CppMicroGemmFP32Vec(CppMicroGemm):
             #     }
             # }
 
-# va[0] = vmid[0] + vmid[1];
+#             va[0] = vmid[0] + vmid[1];
 #             va[1] = vmid[2] + vmid[3];
 #             va[2] = vmid[4] + vmid[5];
 #             va[3] = vmid[6] + vmid[7];
@@ -540,7 +540,7 @@ inline void {{kernel_name}}_kernel(
         };
         c10::ForcedUnroll<ROWS * COLS>{}(storec);
 
-    } else {
+    } else if (true) {
         // for transpose B case
         using VectorizedIn2 = at::vec::Vectorized<{{input2_t}}>;
         VectorizedIn a_in;
@@ -550,6 +550,7 @@ inline void {{kernel_name}}_kernel(
         at::vec::VectorizedN<{{compute_t}}, _K> va;
         at::vec::VectorizedN<{{compute_t}}, BLOCK_N * _K> vb;
         at::vec::VectorizedN<{{compute_t}}, _K> vmid;
+        at::vec::VectorizedN<{{compute_t}}, _K> vmid2;
         auto valpha = Vectorized({{alpha}});
         auto vaccum = Vectorized(0.0f);
 
@@ -562,7 +563,7 @@ inline void {{kernel_name}}_kernel(
         auto compute_trans = [&](auto i, int m, int n) {
             int row = m;
             int col = n;
-            auto elem = std::min(static_cast<int>(K - i * VLEN), VLEN);
+            auto elem = 16;//std::min(static_cast<int>(K - i * VLEN), VLEN);
             if (n == 0) {
 {%- if alpha != 1 %}
                 a_in = VectorizedIn::loadu(A + row * lda + i * VLEN, elem);
@@ -590,34 +591,53 @@ inline void {{kernel_name}}_kernel(
             vmid[i] = at::vec::fmadd(va[i], vb[n * _K + i], zero);
             // store to C
             //if (i == _K - 1) {
-                //for (int j = 0; j < _K; j++) {
-                //    vaccum = vaccum + vmid[i];
-                //}
+                //vaccum = vmid[i] + vmid[i - 1] +  vmid[i - 2] + vmid[i - 3];
                 //auto c = at::vec::vec_reduce_all([](Vectorized& x, Vectorized& y) { return x + y; }, vaccum);
                 //*(C + row * ldc + col) = c;
             //}
         };
 
         auto reduce = [&](unsigned int l) {
+            //for (int i = 1; i < l; i++) {
+            //    vmid[0] = vmid[0] + vmid[i];
+            //}
+            
+            vmid2[0] = vmid[0] + vmid[1];
+            vmid2[1] = vmid[2] + vmid[3];
+            vmid2[2] = vmid[4] + vmid[5];
+            vmid2[3] = vmid[6] + vmid[7];
+            vmid2[4] = vmid[8] + vmid[9];
+            vmid2[5] = vmid[10] + vmid[11];
+            vmid2[6] = vmid[12] + vmid[13];
+            vmid2[7] = vmid[14] + vmid[15];
+            vmid2[8] = vmid[16] + vmid[17];
+            vmid2[9] = vmid[18] + vmid[19];
+            vmid2[10] = vmid[20] + vmid[21];
+            vmid2[11] = vmid[22] + vmid[23];
+            vmid2[12] = vmid[24] + vmid[25];
+            vmid2[13] = vmid[26] + vmid[27];
+            vmid2[14] = vmid[28] + vmid[29];
+            vmid2[15] = vmid[30] + vmid[31];
 
-            const int depth = at::native::utils::CeilLog2(l);
-            //std::cout << "depth: " << depth << "" << std::endl;
-            for (int d = 0; d < depth; d++) {
-                l = d > 0 ? (l >> 1) : l;
-                //std::cout << "l: " << l << std::endl;
-                for (int i = 0; i < l; i++) {
-                    int r = l - 1 - i;
-                    if (i < r) {
-                        vmid[i] = vmid[i] + vmid[r];
-                    } else if (i == r){
-                        vmid[i - 1] = vmid[i - 1] + vmid[i];
-                    } else {
-                        break;
-                    }
-                }
-            }
+            vmid2[16] = vmid2[0] + vmid2[1];
+            vmid2[17] = vmid2[2] + vmid2[3];
+            vmid2[18] = vmid2[4] + vmid2[5];
+            vmid2[19] = vmid2[6] + vmid2[7];
+            vmid2[20] = vmid2[8] + vmid2[9];
+            vmid2[21] = vmid2[10] + vmid2[11];
+            vmid2[22] = vmid2[12] + vmid2[13];
+            vmid2[23] = vmid2[14] + vmid2[15];
 
-            auto c = at::vec::vec_reduce_all([](Vectorized& x, Vectorized& y) { return x + y; }, vmid[0]);
+            vmid2[24] = vmid2[16] + vmid2[17];
+            vmid2[25] = vmid2[18] + vmid2[19];
+            vmid2[26] = vmid2[20] + vmid2[21];
+            vmid2[27] = vmid2[22] + vmid2[23];
+
+            vmid2[28] = vmid2[24] + vmid2[25];
+            vmid2[29] = vmid2[26] + vmid2[27];
+            vmid2[30] = vmid2[28] + vmid2[29];
+            auto c = at::vec::vec_reduce_all([](Vectorized& x, Vectorized& y) { return x + y; }, vmid2[30]);
+            //auto c = _mm512_cvtss_f32(vmid2[30]);
             return c;
         };
 
