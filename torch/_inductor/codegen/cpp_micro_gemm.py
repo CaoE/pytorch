@@ -136,7 +136,7 @@ inline void {{kernel_name}}(
         """
         A_ptr = f"&({kernel.index(A, [0, 0])})"
         # B_ptr = f"&({kernel.index(B, [0, 0])})"
-        B_ptr = f"&(W[static_cast<int64_t>(k_start + 16384L*nci)])"
+        B_ptr = f"&(W[static_cast<int64_t>(k_start + 2048L*nci)])"
         C_ptr = f"&({kernel.index(C, [0, 0])})"
         M = kernel.size(C, 0)
         N = kernel.size(C, 1)
@@ -144,7 +144,7 @@ inline void {{kernel_name}}(
         lda = kernel.stride(A, 0)
         # ldb = kernel.stride(B, 0)
         # print("B layout: ", B.get_layout())
-        ldb = 512
+        ldb = 64
         ldc = kernel.stride(C, 0)
         res = IndentedBuffer()
         res.writeline(f"{self.name}<{value_to_cpp(accum, 'bool')}>(")
@@ -462,6 +462,76 @@ class CppMicroGemmFP32Vec(CppMicroGemm):
 #             va[29] = va[26] + va[27];
 #             va[30] = va[28] + va[29];
 
+
+# b_in = VectorizedIn2::loadu(B + i * VLEN, elem);
+#                 vb[i] = at::vec::convert<{{compute_t}}>(b_in);
+#                 b_in = VectorizedIn2::loadu(B + 1 * ldb + i * VLEN, elem);
+#                 vb[1 * _K + i] = at::vec::convert<{{compute_t}}>(b_in);
+#                 b_in = VectorizedIn2::loadu(B + 2 * ldb + i * VLEN, elem);
+#                 vb[2 * _K + i] = at::vec::convert<{{compute_t}}>(b_in);
+#                 b_in = VectorizedIn2::loadu(B + 3 * ldb + i * VLEN, elem);
+#                 vb[3 * _K + i] = at::vec::convert<{{compute_t}}>(b_in);
+#                 b_in = VectorizedIn2::loadu(B + 4 * ldb + i * VLEN, elem);
+#                 vb[4 * _K + i] = at::vec::convert<{{compute_t}}>(b_in);
+#                 b_in = VectorizedIn2::loadu(B + 5 * ldb + i * VLEN, elem);
+#                 vb[5 * _K + i] = at::vec::convert<{{compute_t}}>(b_in);
+#                 b_in = VectorizedIn2::loadu(B + 6 * ldb + i * VLEN, elem);
+#                 vb[6 * _K + i] = at::vec::convert<{{compute_t}}>(b_in);
+#                 b_in = VectorizedIn2::loadu(B + 7 * ldb + i * VLEN, elem);
+#                 vb[7 * _K + i] = at::vec::convert<{{compute_t}}>(b_in);
+
+#                 b_in = VectorizedIn2::loadu(B + 8 * ldb + i * VLEN, elem);
+#                 vb[8 * _K + i] = at::vec::convert<{{compute_t}}>(b_in);
+#                 b_in = VectorizedIn2::loadu(B + 9 * ldb + i * VLEN, elem);
+#                 vb[9 * _K + i] = at::vec::convert<{{compute_t}}>(b_in);
+#                 b_in = VectorizedIn2::loadu(B + 10 * ldb + i * VLEN, elem);
+#                 vb[10 * _K + i] = at::vec::convert<{{compute_t}}>(b_in);
+#                 b_in = VectorizedIn2::loadu(B + 11 * ldb + i * VLEN, elem);
+#                 vb[11 * _K + i] = at::vec::convert<{{compute_t}}>(b_in);
+#                 b_in = VectorizedIn2::loadu(B + 12 * ldb + i * VLEN, elem);
+#                 vb[12 * _K + i] = at::vec::convert<{{compute_t}}>(b_in);
+#                 b_in = VectorizedIn2::loadu(B + 13 * ldb + i * VLEN, elem);
+#                 vb[13 * _K + i] = at::vec::convert<{{compute_t}}>(b_in);
+#                 b_in = VectorizedIn2::loadu(B + 14 * ldb + i * VLEN, elem);
+#                 vb[14 * _K + i] = at::vec::convert<{{compute_t}}>(b_in);
+#                 b_in = VectorizedIn2::loadu(B + 15 * ldb + i * VLEN, elem);
+#                 vb[15 * _K + i] = at::vec::convert<{{compute_t}}>(b_in);
+
+#                 b_in = VectorizedIn2::loadu(B + 16 * ldb + i * VLEN, elem);
+#                 vb[16 * _K + i] = at::vec::convert<{{compute_t}}>(b_in);
+#                 b_in = VectorizedIn2::loadu(B + 17 * ldb + i * VLEN, elem);
+#                 vb[17 * _K + i] = at::vec::convert<{{compute_t}}>(b_in);
+#                 b_in = VectorizedIn2::loadu(B + 18 * ldb + i * VLEN, elem);
+#                 vb[18 * _K + i] = at::vec::convert<{{compute_t}}>(b_in);
+#                 b_in = VectorizedIn2::loadu(B + 19 * ldb + i * VLEN, elem);
+#                 vb[19 * _K + i] = at::vec::convert<{{compute_t}}>(b_in);
+#                 b_in = VectorizedIn2::loadu(B + 20 * ldb + i * VLEN, elem);
+#                 vb[20 * _K + i] = at::vec::convert<{{compute_t}}>(b_in);
+#                 b_in = VectorizedIn2::loadu(B + 21 * ldb + i * VLEN, elem);
+#                 vb[21 * _K + i] = at::vec::convert<{{compute_t}}>(b_in);
+#                 b_in = VectorizedIn2::loadu(B + 22 * ldb + i * VLEN, elem);
+#                 vb[22 * _K + i] = at::vec::convert<{{compute_t}}>(b_in);
+#                 b_in = VectorizedIn2::loadu(B + 23 * ldb + i * VLEN, elem);
+#                 vb[23 * _K + i] = at::vec::convert<{{compute_t}}>(b_in);
+
+#                 b_in = VectorizedIn2::loadu(B + 24 * ldb + i * VLEN, elem);
+#                 vb[24 * _K + i] = at::vec::convert<{{compute_t}}>(b_in);
+#                 b_in = VectorizedIn2::loadu(B + 25 * ldb + i * VLEN, elem);
+#                 vb[25 * _K + i] = at::vec::convert<{{compute_t}}>(b_in);
+#                 b_in = VectorizedIn2::loadu(B + 26 * ldb + i * VLEN, elem);
+#                 vb[26 * _K + i] = at::vec::convert<{{compute_t}}>(b_in);
+#                 b_in = VectorizedIn2::loadu(B + 27 * ldb + i * VLEN, elem);
+#                 vb[27 * _K + i] = at::vec::convert<{{compute_t}}>(b_in);
+#                 b_in = VectorizedIn2::loadu(B + 28 * ldb + i * VLEN, elem);
+#                 vb[28 * _K + i] = at::vec::convert<{{compute_t}}>(b_in);
+#                 b_in = VectorizedIn2::loadu(B + 29 * ldb + i * VLEN, elem);
+#                 vb[29 * _K + i] = at::vec::convert<{{compute_t}}>(b_in);
+#                 b_in = VectorizedIn2::loadu(B + 30 * ldb + i * VLEN, elem);
+#                 vb[30 * _K + i] = at::vec::convert<{{compute_t}}>(b_in);
+#                 b_in = VectorizedIn2::loadu(B + 31 * ldb + i * VLEN, elem);
+#                 vb[31 * _K + i] = at::vec::convert<{{compute_t}}>(b_in);
+
+
     TEMPLATE_KERNEL = r"""
 
 #include <ATen/native/cpu/moments_utils.h>
@@ -546,109 +616,257 @@ inline void {{kernel_name}}_kernel(
         VectorizedIn a_in;
         VectorizedIn b_in;
         auto zero = Vectorized(0.0f);
-        constexpr int64_t _K = 512 / VLEN;
-        at::vec::VectorizedN<{{compute_t}}, _K> va;
-        at::vec::VectorizedN<{{compute_t}}, BLOCK_N * _K> vb;
-        at::vec::VectorizedN<{{compute_t}}, _K> vmid;
-        at::vec::VectorizedN<{{compute_t}}, _K> vmid2;
-        auto valpha = Vectorized({{alpha}});
-        auto vaccum = Vectorized(0.0f);
+        int _K = K / VLEN;
+        constexpr int sN = 4;
+        constexpr int sM = 4;
+        constexpr int bN = BLOCK_N / sN;
+        constexpr int bM = BLOCK_M / sM;
+        at::vec::Vectorized<{{compute_t}}> va;
+        //at::vec::VectorizedN<{{compute_t}}, sN * _K> vb;
+        at::vec::Vectorized<{{compute_t}}> vb[sN * _K];
+        at::vec::VectorizedN<{{compute_t}}, sN * sM> vmid;
+        auto valpha = at::vec::Vectorized<{{compute_t}}>({{alpha}});
 
         // B inner profuct: B is transposed
         // for B, K dim is contiguous.
         // Note ldb should be ld of N dim for B
-        // read vec alone k
-        // compute c[i][j] and store directly
 
-        auto compute_trans = [&](auto i, int m, int n) {
-            int row = m;
-            int col = n;
-            auto elem = 16;//std::min(static_cast<int>(K - i * VLEN), VLEN);
-            if (n == 0) {
-{%- if alpha != 1 %}
-                a_in = VectorizedIn::loadu(A + row * lda + i * VLEN, elem);
-                va[i] = at::vec::convert<{{compute_t}}>(a_in) * valpha;
-{%- else %}
-                a_in = VectorizedIn::loadu(A + row * lda + i * VLEN, elem);
-                va[i] = at::vec::convert<{{compute_t}}>(a_in);
-{%- endif %}
-            }
-
+        auto compute_trans = [&](int m, int n, int idk) { //   auto idk, int n, int m
+            constexpr int e_n = sN;
             if (m == 0) {
-{%- if input2_dtype in [torch.bfloat16, torch.float16] %}
-                b_in = VectorizedIn2::loadu(B + col * ldb + i * VLEN, elem);
-                vb[n * _K + i] = at::vec::convert<{{compute_t}}>(b_in);
-{%- elif input2_dtype == torch.int8 %}
-                // Convert VLEN int8 elements to int32, and then fp32
-                // Note int8 K should be divided by VLEN
-                auto b32 = at::vec::convert_to_int32<int8_t>(B + col * ldb + i * VLEN);
-                vb[n * _K + i] = at::vec::convert<float>(b32);
+                #pragma unroll
+                for (int i = 0; i < e_n; i++) {
+                    b_in = VectorizedIn2::loadu(B + (sN * n + i) * ldb + idk * VLEN, VLEN);
+                    vb[sN * idk + i] = at::vec::convert<{{compute_t}}>(b_in);
+                }
+            }
+            if (idk == 0) {
+                #pragma unroll
+                for (int s = 0; s < sM; s++) {
+{%- if alpha != 1 %}
+                    a_in = VectorizedIn::loadu(A + (sM * m + s) * lda + idk * VLEN, VLEN);
+                    va = at::vec::convert<{{compute_t}}>(a_in) * valpha;
 {%- else %}
-                vb[n * _K + i] = Vectorized::loadu(B + col * ldb + i * VLEN);
+                    a_in = VectorizedIn::loadu(A + (sM * m + s) * lda + idk * VLEN, VLEN);
+                    va = at::vec::convert<{{compute_t}}>(a_in);
 {%- endif %}
+
+                    #pragma unroll
+                    for (int i = 0; i < e_n; i++) {
+                        vmid[sN * s + i] = at::vec::fmadd(va, vb[sN * idk + i], zero);
+                    }
+                }
+            } else {
+                #pragma unroll
+                for (int s = 0; s < sM; s++) {
+{%- if alpha != 1 %}
+                    a_in = VectorizedIn::loadu(A + (sM * m + s) * lda + idk * VLEN, VLEN);
+                    va = at::vec::convert<{{compute_t}}>(a_in) * valpha;
+{%- else %}
+                    a_in = VectorizedIn::loadu(A + (sM * m + s) * lda + idk * VLEN, VLEN);
+                    va = at::vec::convert<{{compute_t}}>(a_in);
+{%- endif %}
+                    #pragma unroll
+                    for (int i = 0; i < e_n; i++) {
+                        vmid[sN * s + i] = at::vec::fmadd(va, vb[sN * idk + i], vmid[sN * s + i]);
+                    }
+                }
             }
 
-            vmid[i] = at::vec::fmadd(va[i], vb[n * _K + i], zero);
             // store to C
-            //if (i == _K - 1) {
-                //vaccum = vmid[i] + vmid[i - 1] +  vmid[i - 2] + vmid[i - 3];
-                //auto c = at::vec::vec_reduce_all([](Vectorized& x, Vectorized& y) { return x + y; }, vaccum);
-                //*(C + row * ldc + col) = c;
-            //}
+            if (idk == _K - 1) {
+                #pragma unroll
+                for (int s = 0; s < sM; s++) {
+                    #pragma unroll
+                    for (int i = 0; i < e_n; i++) {
+                        auto v = at::vec::vec_reduce_all([](Vectorized& x, Vectorized& y) { return x + y; }, vmid[sN * s + i]);
+                        if constexpr (accum) {
+                            auto c = *(C + (sM * m + s) * ldc + sN * n + i);
+                            *(C + (sM * m + s) * ldc + sN * n + i) = c + v;
+                        } else {
+                            *(C + (sM * m + s) * ldc + sN * n + i) = v;
+                        }
+                    }
+                }
+            }
         };
 
-        auto reduce = [&](unsigned int l) {
-            //for (int i = 1; i < l; i++) {
-            //    vmid[0] = vmid[0] + vmid[i];
-            //}
-            
-            vmid2[0] = vmid[0] + vmid[1];
-            vmid2[1] = vmid[2] + vmid[3];
-            vmid2[2] = vmid[4] + vmid[5];
-            vmid2[3] = vmid[6] + vmid[7];
-            vmid2[4] = vmid[8] + vmid[9];
-            vmid2[5] = vmid[10] + vmid[11];
-            vmid2[6] = vmid[12] + vmid[13];
-            vmid2[7] = vmid[14] + vmid[15];
-            vmid2[8] = vmid[16] + vmid[17];
-            vmid2[9] = vmid[18] + vmid[19];
-            vmid2[10] = vmid[20] + vmid[21];
-            vmid2[11] = vmid[22] + vmid[23];
-            vmid2[12] = vmid[24] + vmid[25];
-            vmid2[13] = vmid[26] + vmid[27];
-            vmid2[14] = vmid[28] + vmid[29];
-            vmid2[15] = vmid[30] + vmid[31];
-
-            vmid2[16] = vmid2[0] + vmid2[1];
-            vmid2[17] = vmid2[2] + vmid2[3];
-            vmid2[18] = vmid2[4] + vmid2[5];
-            vmid2[19] = vmid2[6] + vmid2[7];
-            vmid2[20] = vmid2[8] + vmid2[9];
-            vmid2[21] = vmid2[10] + vmid2[11];
-            vmid2[22] = vmid2[12] + vmid2[13];
-            vmid2[23] = vmid2[14] + vmid2[15];
-
-            vmid2[24] = vmid2[16] + vmid2[17];
-            vmid2[25] = vmid2[18] + vmid2[19];
-            vmid2[26] = vmid2[20] + vmid2[21];
-            vmid2[27] = vmid2[22] + vmid2[23];
-
-            vmid2[28] = vmid2[24] + vmid2[25];
-            vmid2[29] = vmid2[26] + vmid2[27];
-            vmid2[30] = vmid2[28] + vmid2[29];
-            auto c = at::vec::vec_reduce_all([](Vectorized& x, Vectorized& y) { return x + y; }, vmid2[30]);
-            //auto c = _mm512_cvtss_f32(vmid2[30]);
-            return c;
-        };
-
-        for (int m = 0; m < BLOCK_M; ++m) {
-            for (int n = 0; n < BLOCK_N; ++n) {
-                c10::ForcedUnroll<_K>{}(compute_trans, m, n);
-                auto c = reduce(_K);
-                *(C + m * ldc + n) = c;
-
+        for (int n = 0; n < bN; ++n) {
+            for (int m = 0; m < bM; ++m) {
+                #pragma unroll
+                for (int k = 0; k < _K; ++k) {
+                    compute_trans(m, n, k);
+                }
             }
         }
+
+    } else if (false) { // transpose + gemm
+        constexpr auto ROWS = BLOCK_M;
+        constexpr auto COLS = BLOCK_N / VLEN;
+        constexpr int _K = 64 / VLEN;
+        Vectorized va;
+        at::vec::VectorizedN<{{compute_t}}, VLEN> vb;
+        at::vec::VectorizedN<{{compute_t}}, ROWS*COLS> vc;
+
+        auto loadc = [&](auto i) {
+            if constexpr (accum) {
+                constexpr int row = i / COLS;
+                constexpr int col = i % COLS;
+                vc[i] = Vectorized::loadu(C + row * ldc + col * VLEN);
+            } else {
+                vc[i] = Vectorized(0.0f);
+            }
+        };
+        c10::ForcedUnroll<ROWS * COLS>{}(loadc);
+
+        auto compute = [&, COLS](auto i) {
+            constexpr int row = i % ROWS;
+            constexpr int col = (i / ROWS) % COLS;
+            constexpr int e_col = (i / ROWS) % COLS * VLEN;
+            constexpr int idk = (i / ROWS / COLS) * VLEN;
+
+            if constexpr (row == 0) {
+                auto b = VectorizedIn::loadu(B + e_col * ldb + idk, VLEN);
+                vb[0] = at::vec::convert<{{compute_t}}>(b);
+                b = VectorizedIn::loadu(B + (e_col + 1) * ldb + idk, VLEN);
+                vb[1] = at::vec::convert<{{compute_t}}>(b);
+                b = VectorizedIn::loadu(B + (e_col + 2) * ldb + idk, VLEN);
+                vb[2] = at::vec::convert<{{compute_t}}>(b);
+                b = VectorizedIn::loadu(B + (e_col + 3) * ldb + idk, VLEN);
+                vb[3] = at::vec::convert<{{compute_t}}>(b);
+                b = VectorizedIn::loadu(B + (e_col + 4) * ldb + idk, VLEN);
+                vb[4] = at::vec::convert<{{compute_t}}>(b);
+                b = VectorizedIn::loadu(B + (e_col + 5) * ldb + idk, VLEN);
+                vb[5] = at::vec::convert<{{compute_t}}>(b);
+                b = VectorizedIn::loadu(B + (e_col + 6) * ldb + idk, VLEN);
+                vb[6] = at::vec::convert<{{compute_t}}>(b);
+                b = VectorizedIn::loadu(B + (e_col + 7) * ldb + idk, VLEN);
+                vb[7] = at::vec::convert<{{compute_t}}>(b);
+                b = VectorizedIn::loadu(B + (e_col + 8) * ldb + idk, VLEN);
+                vb[8] = at::vec::convert<{{compute_t}}>(b);
+                b = VectorizedIn::loadu(B + (e_col + 9) * ldb + idk, VLEN);
+                vb[9] = at::vec::convert<{{compute_t}}>(b);
+                b = VectorizedIn::loadu(B + (e_col + 10) * ldb + idk, VLEN);
+                vb[10] = at::vec::convert<{{compute_t}}>(b);
+                b = VectorizedIn::loadu(B + (e_col + 11) * ldb + idk, VLEN);
+                vb[11] = at::vec::convert<{{compute_t}}>(b);
+                b = VectorizedIn::loadu(B + (e_col + 12) * ldb + idk, VLEN);
+                vb[12] = at::vec::convert<{{compute_t}}>(b);
+                b = VectorizedIn::loadu(B + (e_col + 13) * ldb + idk, VLEN);
+                vb[13] = at::vec::convert<{{compute_t}}>(b);
+                b = VectorizedIn::loadu(B + (e_col + 14) * ldb + idk, VLEN);
+                vb[14] = at::vec::convert<{{compute_t}}>(b);
+                b = VectorizedIn::loadu(B + (e_col + 15) * ldb + idk, VLEN);
+                vb[15] = at::vec::convert<{{compute_t}}>(b);
+                at::vec::VectorizedN<{{compute_t}}, VLEN> vb_trans;
+                vb_trans[0] = _mm512_unpacklo_ps(vb[0], vb[1]);
+                vb_trans[1] = _mm512_unpackhi_ps(vb[0], vb[1]);
+                vb_trans[2] = _mm512_unpacklo_ps(vb[2], vb[3]);
+                vb_trans[3] = _mm512_unpackhi_ps(vb[2], vb[3]);
+                vb_trans[4] = _mm512_unpacklo_ps(vb[4], vb[5]);
+                vb_trans[5] = _mm512_unpackhi_ps(vb[4], vb[5]);
+                vb_trans[6] = _mm512_unpacklo_ps(vb[6], vb[7]);
+                vb_trans[7] = _mm512_unpackhi_ps(vb[6], vb[7]);
+                vb_trans[8] = _mm512_unpacklo_ps(vb[8], vb[9]);
+                vb_trans[9] = _mm512_unpackhi_ps(vb[8], vb[9]);
+                vb_trans[10] = _mm512_unpacklo_ps(vb[10], vb[11]);
+                vb_trans[11] = _mm512_unpackhi_ps(vb[10], vb[11]);
+                vb_trans[12] = _mm512_unpacklo_ps(vb[12], vb[13]);
+                vb_trans[13] = _mm512_unpackhi_ps(vb[12], vb[13]);
+                vb_trans[14] = _mm512_unpacklo_ps(vb[14], vb[15]);
+                vb_trans[15] = _mm512_unpackhi_ps(vb[14], vb[15]);
+                vb[0] = _mm512_castpd_ps(
+                    _mm512_unpacklo_pd(_mm512_castps_pd(vb_trans[0]), _mm512_castps_pd(vb_trans[2])));
+                vb[1] = _mm512_castpd_ps(
+                    _mm512_unpackhi_pd(_mm512_castps_pd(vb_trans[0]), _mm512_castps_pd(vb_trans[2])));
+                vb[2] = _mm512_castpd_ps(
+                    _mm512_unpacklo_pd(_mm512_castps_pd(vb_trans[1]), _mm512_castps_pd(vb_trans[3])));
+                vb[3] = _mm512_castpd_ps(
+                    _mm512_unpackhi_pd(_mm512_castps_pd(vb_trans[1]), _mm512_castps_pd(vb_trans[3])));
+                vb[4] = _mm512_castpd_ps(
+                    _mm512_unpacklo_pd(_mm512_castps_pd(vb_trans[4]), _mm512_castps_pd(vb_trans[6])));
+                vb[5] = _mm512_castpd_ps(
+                    _mm512_unpackhi_pd(_mm512_castps_pd(vb_trans[4]), _mm512_castps_pd(vb_trans[6])));
+                vb[6] = _mm512_castpd_ps(
+                    _mm512_unpacklo_pd(_mm512_castps_pd(vb_trans[5]), _mm512_castps_pd(vb_trans[7])));
+                vb[7] = _mm512_castpd_ps(
+                    _mm512_unpackhi_pd(_mm512_castps_pd(vb_trans[5]), _mm512_castps_pd(vb_trans[7])));
+                vb[8] = _mm512_castpd_ps(
+                    _mm512_unpacklo_pd(_mm512_castps_pd(vb_trans[8]), _mm512_castps_pd(vb_trans[10])));
+                vb[9] = _mm512_castpd_ps(
+                    _mm512_unpackhi_pd(_mm512_castps_pd(vb_trans[8]), _mm512_castps_pd(vb_trans[10])));
+                vb[10] = _mm512_castpd_ps(
+                    _mm512_unpacklo_pd(_mm512_castps_pd(vb_trans[9]), _mm512_castps_pd(vb_trans[11])));
+                vb[11] = _mm512_castpd_ps(
+                    _mm512_unpackhi_pd(_mm512_castps_pd(vb_trans[9]), _mm512_castps_pd(vb_trans[11])));
+                vb[12] = _mm512_castpd_ps(
+                    _mm512_unpacklo_pd(_mm512_castps_pd(vb_trans[12]), _mm512_castps_pd(vb_trans[14])));
+                vb[13] = _mm512_castpd_ps(
+                    _mm512_unpackhi_pd(_mm512_castps_pd(vb_trans[12]), _mm512_castps_pd(vb_trans[14])));
+                vb[14] = _mm512_castpd_ps(
+                    _mm512_unpacklo_pd(_mm512_castps_pd(vb_trans[13]), _mm512_castps_pd(vb_trans[15])));
+                vb[15] = _mm512_castpd_ps(
+                    _mm512_unpackhi_pd(_mm512_castps_pd(vb_trans[13]), _mm512_castps_pd(vb_trans[15])));
+
+                vb_trans[0] = _mm512_shuffle_f32x4(vb[0], vb[4], 0x88);
+                vb_trans[1] = _mm512_shuffle_f32x4(vb[1], vb[5], 0x88);
+                vb_trans[2] = _mm512_shuffle_f32x4(vb[2], vb[6], 0x88);
+                vb_trans[3] = _mm512_shuffle_f32x4(vb[3], vb[7], 0x88);
+                vb_trans[4] = _mm512_shuffle_f32x4(vb[0], vb[4], 0xdd);
+                vb_trans[5] = _mm512_shuffle_f32x4(vb[1], vb[5], 0xdd);
+                vb_trans[6] = _mm512_shuffle_f32x4(vb[2], vb[6], 0xdd);
+                vb_trans[7] = _mm512_shuffle_f32x4(vb[3], vb[7], 0xdd);
+                vb_trans[8] = _mm512_shuffle_f32x4(vb[8], vb[12], 0x88);
+                vb_trans[9] = _mm512_shuffle_f32x4(vb[9], vb[13], 0x88);
+                vb_trans[10] = _mm512_shuffle_f32x4(vb[10], vb[14], 0x88);
+                vb_trans[11] = _mm512_shuffle_f32x4(vb[11], vb[15], 0x88);
+                vb_trans[12] = _mm512_shuffle_f32x4(vb[8], vb[12], 0xdd);
+                vb_trans[13] = _mm512_shuffle_f32x4(vb[9], vb[13], 0xdd);
+                vb_trans[14] = _mm512_shuffle_f32x4(vb[10], vb[14], 0xdd);
+                vb_trans[15] = _mm512_shuffle_f32x4(vb[11], vb[15], 0xdd);
+
+                vb[0] = _mm512_shuffle_f32x4(vb_trans[0], vb_trans[8], 0x88);
+                vb[1] = _mm512_shuffle_f32x4(vb_trans[1], vb_trans[9], 0x88);
+                vb[2] = _mm512_shuffle_f32x4(vb_trans[2], vb_trans[10], 0x88);
+                vb[3] = _mm512_shuffle_f32x4(vb_trans[3], vb_trans[11], 0x88);
+                vb[4] = _mm512_shuffle_f32x4(vb_trans[4], vb_trans[12], 0x88);
+                vb[5] = _mm512_shuffle_f32x4(vb_trans[5], vb_trans[13], 0x88);
+                vb[6] = _mm512_shuffle_f32x4(vb_trans[6], vb_trans[14], 0x88);
+                vb[7] = _mm512_shuffle_f32x4(vb_trans[7], vb_trans[15], 0x88);
+                vb[8] = _mm512_shuffle_f32x4(vb_trans[0], vb_trans[8], 0xdd);
+                vb[9] = _mm512_shuffle_f32x4(vb_trans[1], vb_trans[9], 0xdd);
+                vb[10] = _mm512_shuffle_f32x4(vb_trans[2], vb_trans[10], 0xdd);
+                vb[11] = _mm512_shuffle_f32x4(vb_trans[3], vb_trans[11], 0xdd);
+                vb[12] = _mm512_shuffle_f32x4(vb_trans[4], vb_trans[12], 0xdd);
+                vb[13] = _mm512_shuffle_f32x4(vb_trans[5], vb_trans[13], 0xdd);
+                vb[14] = _mm512_shuffle_f32x4(vb_trans[6], vb_trans[14], 0xdd);
+                vb[15] = _mm512_shuffle_f32x4(vb_trans[7], vb_trans[15], 0xdd);
+            }
+
+            constexpr int idx = row * COLS + col;
+
+            #pragma unroll
+            for (int i = 0; i < 16; i++) {
+{%- if alpha != 1 %}
+                    va = Vectorized(static_cast<{{compute_t}}>(A[row * lda + idk + i]) * {{alpha}});
+{%- else %}
+                    va = Vectorized(static_cast<{{compute_t}}>(A[row * lda + idk + i]));
+{%- endif %}
+                vc[idx] = at::vec::fmadd(va, vb[i], vc[idx]);
+            }
+
+        };
+
+        c10::ForcedUnroll<ROWS * _K * COLS>{}(compute);
+
+        // store to C
+        auto storec = [&](auto i) {
+            constexpr int row = i / COLS;
+            constexpr int col = i % COLS;
+            vc[i].store(C + row * ldc + col * VLEN);
+        };
+        c10::ForcedUnroll<ROWS * COLS>{}(storec);
+
     }
 }
 """
