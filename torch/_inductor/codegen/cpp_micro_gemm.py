@@ -535,7 +535,7 @@ class CppMicroGemmFP32Vec(CppMicroGemm):
     TEMPLATE_KERNEL = r"""
 
 #include <ATen/native/cpu/moments_utils.h>
-
+#include <vector>
 template <int64_t BLOCK_M, int64_t BLOCK_N, bool accum>
 inline void {{kernel_name}}_kernel(
     const {{input_t}}* {{restrict_keyword}} A,
@@ -616,13 +616,15 @@ inline void {{kernel_name}}_kernel(
         VectorizedIn a_in;
         VectorizedIn b_in;
         auto zero = Vectorized(0.0f);
-        int _K = K / VLEN;
+        int _K = (K + VLEN - 1) / VLEN;
         constexpr int sN = 4;
         constexpr int sM = 4;
-        constexpr int bN = BLOCK_N / sN;
-        constexpr int bM = BLOCK_M / sM;
+
+        constexpr int bN = (BLOCK_N + sN - 1) / sN;
+        constexpr int bM = (BLOCK_M + sM - 1) / sM;
         at::vec::Vectorized<{{compute_t}}> va;
         //at::vec::VectorizedN<{{compute_t}}, sN * _K> vb;
+        //std::vector<at::vec::Vectorized<{{compute_t}}>> vb(sN * _K);
         at::vec::Vectorized<{{compute_t}}> vb[sN * _K];
         at::vec::VectorizedN<{{compute_t}}, sN * sM> vmid;
         auto valpha = at::vec::Vectorized<{{compute_t}}>({{alpha}});
@@ -630,43 +632,52 @@ inline void {{kernel_name}}_kernel(
         // B inner profuct: B is transposed
         // for B, K dim is contiguous.
         // Note ldb should be ld of N dim for B
+        constexpr int ntail = BLOCK_N % sN;
+        constexpr int mtail = BLOCK_M % sM;
+        constexpr int ktail = 64 % VLEN;
 
-        auto compute_trans = [&](int m, int n, int idk) { //   auto idk, int n, int m
-            constexpr int e_n = sN;
+        auto compute_trans = [&](int m, int n, int idk) { // int m, int n, int idk  auto idk, int n, int m
+            //constexpr int idk = index % _K;
+            //constexpr int m = (index / _K) % bM;
+            //constexpr int n = index / _K / bM;
+            int e_n = (n == bN - 1 && ntail != 0) ? (BLOCK_N - n * sN) : sN;
+            int e_m = (m == bM - 1 && mtail != 0) ? (BLOCK_M - m * sM) : sM;
+            //int idk = k * sK + ik;
+            int e_k = (idk == _K - 1 && ktail != 0) ? (64 - idk * VLEN) : VLEN;
             if (m == 0) {
-                #pragma unroll
+                {{kernel.unroll_pragma(4)}}
                 for (int i = 0; i < e_n; i++) {
-                    b_in = VectorizedIn2::loadu(B + (sN * n + i) * ldb + idk * VLEN, VLEN);
+                    b_in = VectorizedIn2::loadu(B + (sN * n + i) * ldb + idk * VLEN, e_k);
                     vb[sN * idk + i] = at::vec::convert<{{compute_t}}>(b_in);
                 }
             }
             if (idk == 0) {
-                #pragma unroll
-                for (int s = 0; s < sM; s++) {
+                {{kernel.unroll_pragma(4)}}
+                for (int s = 0; s < e_m; s++) {
 {%- if alpha != 1 %}
-                    a_in = VectorizedIn::loadu(A + (sM * m + s) * lda + idk * VLEN, VLEN);
+                    a_in = VectorizedIn::loadu(A + (sM * m + s) * lda + idk * VLEN, e_k);
                     va = at::vec::convert<{{compute_t}}>(a_in) * valpha;
 {%- else %}
-                    a_in = VectorizedIn::loadu(A + (sM * m + s) * lda + idk * VLEN, VLEN);
+                    a_in = VectorizedIn::loadu(A + (sM * m + s) * lda + idk * VLEN, e_k);
                     va = at::vec::convert<{{compute_t}}>(a_in);
 {%- endif %}
 
-                    #pragma unroll
+                    {{kernel.unroll_pragma(4)}}
                     for (int i = 0; i < e_n; i++) {
                         vmid[sN * s + i] = at::vec::fmadd(va, vb[sN * idk + i], zero);
                     }
                 }
             } else {
-                #pragma unroll
-                for (int s = 0; s < sM; s++) {
+                {{kernel.unroll_pragma(4)}}
+                for (int s = 0; s < e_m; s++) {
 {%- if alpha != 1 %}
-                    a_in = VectorizedIn::loadu(A + (sM * m + s) * lda + idk * VLEN, VLEN);
+                    a_in = VectorizedIn::loadu(A + (sM * m + s) * lda + idk * VLEN, e_k);
                     va = at::vec::convert<{{compute_t}}>(a_in) * valpha;
 {%- else %}
-                    a_in = VectorizedIn::loadu(A + (sM * m + s) * lda + idk * VLEN, VLEN);
+                    a_in = VectorizedIn::loadu(A + (sM * m + s) * lda + idk * VLEN, e_k);
                     va = at::vec::convert<{{compute_t}}>(a_in);
 {%- endif %}
-                    #pragma unroll
+                    {{kernel.unroll_pragma(4)}}
                     for (int i = 0; i < e_n; i++) {
                         vmid[sN * s + i] = at::vec::fmadd(va, vb[sN * idk + i], vmid[sN * s + i]);
                     }
@@ -675,9 +686,9 @@ inline void {{kernel_name}}_kernel(
 
             // store to C
             if (idk == _K - 1) {
-                #pragma unroll
-                for (int s = 0; s < sM; s++) {
-                    #pragma unroll
+                {{kernel.unroll_pragma(4)}}
+                for (int s = 0; s < e_m; s++) {
+                    {{kernel.unroll_pragma(4)}}
                     for (int i = 0; i < e_n; i++) {
                         auto v = at::vec::vec_reduce_all([](Vectorized& x, Vectorized& y) { return x + y; }, vmid[sN * s + i]);
                         if constexpr (accum) {
@@ -693,17 +704,22 @@ inline void {{kernel_name}}_kernel(
 
         for (int n = 0; n < bN; ++n) {
             for (int m = 0; m < bM; ++m) {
-                #pragma unroll
+                //for (int k = 0; k < bK; ++k) {
+                //    c10::ForcedUnroll<sK>{}(compute_trans, m, n, k);
+                //}
+
+                {{kernel.unroll_pragma(4)}}
                 for (int k = 0; k < _K; ++k) {
                     compute_trans(m, n, k);
                 }
             }
         }
+        //c10::ForcedUnroll<bN * bM * _K>{}(compute_trans);
 
     } else if (false) { // transpose + gemm
         constexpr auto ROWS = BLOCK_M;
         constexpr auto COLS = BLOCK_N / VLEN;
-        constexpr int _K = 64 / VLEN;
+        int _K = K / VLEN;
         Vectorized va;
         at::vec::VectorizedN<{{compute_t}}, VLEN> vb;
         at::vec::VectorizedN<{{compute_t}}, ROWS*COLS> vc;
@@ -719,11 +735,11 @@ inline void {{kernel_name}}_kernel(
         };
         c10::ForcedUnroll<ROWS * COLS>{}(loadc);
 
-        auto compute = [&, COLS](auto i) {
+        auto compute = [&, COLS](auto i, int k) {
             constexpr int row = i % ROWS;
-            constexpr int col = (i / ROWS) % COLS;
-            constexpr int e_col = (i / ROWS) % COLS * VLEN;
-            constexpr int idk = (i / ROWS / COLS) * VLEN;
+            constexpr int col = i / ROWS;
+            constexpr int e_col = col * VLEN;
+            int idk = k * VLEN;
 
             if constexpr (row == 0) {
                 auto b = VectorizedIn::loadu(B + e_col * ldb + idk, VLEN);
@@ -857,7 +873,9 @@ inline void {{kernel_name}}_kernel(
 
         };
 
-        c10::ForcedUnroll<ROWS * _K * COLS>{}(compute);
+        for (int k = 0; k < _K; ++k) {
+            c10::ForcedUnroll<ROWS * COLS>{}(compute, k);
+        }
 
         // store to C
         auto storec = [&](auto i) {
