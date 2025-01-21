@@ -974,7 +974,7 @@ transpose_NxN(
     srcs[13] = at::vec::convert<compute_t>(VectorizedIn::loadu(src_ptr + 13 * ld, load_size));
     srcs[14] = at::vec::convert<compute_t>(VectorizedIn::loadu(src_ptr + 14 * ld, load_size));
     srcs[15] = at::vec::convert<compute_t>(VectorizedIn::loadu(src_ptr + 15 * ld, load_size));
-  } else if (std::is_same_v<input_t, int8>) {
+  } else if constexpr (std::is_same_v<input_t, int8_t>) {
     srcs[0] = at::vec::convert<compute_t>(at::vec::convert_to_int32<int8_t>(src_ptr, load_size));
     srcs[1] = at::vec::convert<compute_t>(at::vec::convert_to_int32<int8_t>(src_ptr + ld, load_size));
     srcs[2] = at::vec::convert<compute_t>(at::vec::convert_to_int32<int8_t>(src_ptr + 2 * ld, load_size));
@@ -1114,7 +1114,7 @@ int64_t load_size) {
     srcs[5] = at::vec::convert<compute_t>(VectorizedIn::loadu(src_ptr + 5 * ld, load_size));
     srcs[6] = at::vec::convert<compute_t>(VectorizedIn::loadu(src_ptr + 6 * ld, load_size));
     srcs[7] = at::vec::convert<compute_t>(VectorizedIn::loadu(src_ptr + 7 * ld, load_size));
-  } else if constexpr (std::is_same_v<input_t, int8>) {
+  } else if constexpr (std::is_same_v<input_t, int8_t>) {
     srcs[0] = at::vec::convert<compute_t>(at::vec::convert_to_int32<int8_t>(src_ptr, load_size));
     srcs[1] = at::vec::convert<compute_t>(at::vec::convert_to_int32<int8_t>(src_ptr + ld, load_size));
     srcs[2] = at::vec::convert<compute_t>(at::vec::convert_to_int32<int8_t>(src_ptr + 2 * ld, load_size));
