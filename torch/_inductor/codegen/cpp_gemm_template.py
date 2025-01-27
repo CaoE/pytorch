@@ -228,11 +228,14 @@ GEMM_TEMPLATE = r"""
 {%- else %}
 {%- set tile_W = kernel.slice_nd(W, [("k_start", "k_end"), ("n_start", "n_start + n_size")]) %}
 {%- endif %}
+                        //auto t1 = std::chrono::high_resolution_clock::now();
                         if (kc == k_block_start) {
                             {{ micro_gemm.codegen_call(kernel, tile_X, tile_W, acc_slice, accum=False)|indent(28, false) }}
                         } else {
                             {{ micro_gemm.codegen_call(kernel, tile_X, tile_W, acc_slice, accum=True)|indent(28, false) }}
                         }
+                        //auto t2 = std::chrono::high_resolution_clock::now();
+                        //std::cout << "fp16 gemm: " << std::chrono::duration_cast<res>(t2 - t1).count() << " ns" << std::endl;;
                     }
                 }
 {%- if maybe_k_slicing %}

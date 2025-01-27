@@ -64,6 +64,10 @@ extern "C" void zaxpy_(int *n, void *a, const void *x, int *incx, void *y, int *
 #include <oneapi/dnnl/dnnl.hpp>
 #endif // oneDNN BRGEMM
 
+#include <iostream>
+#include <chrono>
+typedef std::chrono::nanoseconds res;
+
 namespace at::native::cpublas {
 namespace internal {
 
@@ -1104,20 +1108,93 @@ struct Brgemm : public KernelCache <BrgemmKey, GemmHelper> {
       (*v).brg.generate();
       return std::move(v);
     });
-    if (get_current() != value) {
+    // if (get_current() != value) {
+// #if defined(ONEDNN_UKERNEL_1)
+//       dnnl::ukernel::brgemm::release_hw_context();
+// #endif
+      auto t1 = std::chrono::high_resolution_clock::now();
+      ((*value).brg).set_hw_context();
+      auto t2 = std::chrono::high_resolution_clock::now();
+      std::cout << "fp16 config: " << std::chrono::duration_cast<res>(t2 - t1).count() << "ns\n";
+
+    //   get_current() = value;
+    // }
+    ((*value).brg)
+        .execute(A, B, (*value).A_B_offsets, C, (*value).scratchpad.data());
+  }
+
+  // Fetch/create GemmHelper object with batch size = 1
+  // Note: Separating Fetch/create from execution can save hash and fetching overhead
+  // and improve performance on small shapes.
+  static inline GemmHelper* create(
+      int64_t M,
+      int64_t N,
+      int64_t K,
+      int64_t ld_a,
+      int64_t ld_b,
+      int64_t ld_c,
+      const bool add_C,
+      ScalarType dt_a,
+      ScalarType dt_b,
+      ScalarType dt_c) {
+    auto&& key = BrgemmKey(
+        M,
+        N,
+        K,
+        int64_t(1),
+        ld_a,
+        ld_b,
+        ld_c,
+        dt_a,
+        dt_b,
+        dt_c,
+        add_C);
+    // Fetch/create GemmHelper object
+    auto&& value = fetch_or_create(key, [&]() {
+      auto&& v = std::make_shared<GemmHelper>(
+          M,
+          N,
+          K,
+          int64_t(1),
+          ld_a,
+          ld_b,
+          ld_c,
+          dt_a,
+          dt_b,
+          dt_c,
+          add_C);
+      (*v).brg.generate();
+      return std::move(v);
+    });
+    return value.get();
+  }
+
+  // execute brgemm
+  template <typename scalar_t_a, typename scalar_t_b, typename scalar_t_c>
+  static inline void execute(
+    GemmHelper* ghelper,
+    const scalar_t_a* A,
+    const scalar_t_b* B,
+    scalar_t_c* C) {
+    if (get_current_ptr() != ghelper) {
 #if defined(ONEDNN_UKERNEL_1)
       dnnl::ukernel::brgemm::release_hw_context();
 #endif
-      ((*value).brg).set_hw_context();
-      get_current() = value;
+      ((*ghelper).brg).set_hw_context();
+      get_current_ptr() = ghelper;
     }
-    ((*value).brg)
-        .execute(A, B, (*value).A_B_offsets, C, (*value).scratchpad.data());
+    ((*ghelper).brg)
+        .execute(A, B, (*ghelper).A_B_offsets, C, (*ghelper).scratchpad.data());
   }
 
   static inline std::shared_ptr<GemmHelper>& get_current() {
     static thread_local std::shared_ptr<GemmHelper> current;
     return current;
+  }
+
+  static inline GemmHelper* & get_current_ptr() {
+    static thread_local GemmHelper * current1=nullptr;
+    return current1;
   }
 
   static inline bool device_check(ScalarType dtype) {
@@ -1346,6 +1423,7 @@ void brgemm_release(bool is_vnni) {
   if (is_vnni) {
     dnnl::ukernel::brgemm::release_hw_context();
     Brgemm::get_current() = nullptr;
+    Brgemm::get_current_ptr() = nullptr;
   }
 #endif
 }
@@ -1372,6 +1450,53 @@ bool could_pack(ScalarType dt_in) {
 #else
   return false;
 #endif
+}
+
+GemmHelper* brgemm_create(
+    int64_t M,
+    int64_t N,
+    int64_t K,
+    int64_t ld_a,
+    int64_t ld_b,
+    int64_t ld_c,
+    const bool add_C,
+    ScalarType dt_a,
+    ScalarType dt_b,
+    ScalarType dt_c) {
+  return Brgemm::create(
+    M, N, K, ld_a, ld_b, ld_c, add_C, dt_a, dt_b, dt_c);
+}
+
+void brgemm_execute(
+  GemmHelper* ghelper,
+  const at::Half* A,
+  const at::Half* B,
+  float* C) {
+#if defined(ONEDNN_UKERNEL_ENABLED)
+  if (Brgemm::device_check(ScalarType::Half)) {
+    Brgemm::execute<at::Half, at::Half, float>(
+      ghelper, A, B, C);
+    return;
+  }
+#endif
+  TORCH_CHECK(false,
+  "Half Brgemm is only supported on X64 when oneDNN ukernel is enabled and avx512_fp16 is supported");
+}
+
+void brgemm_execute(
+  GemmHelper* ghelper,
+  const at::BFloat16* A,
+  const at::BFloat16* B,
+  float* C) {
+#if defined(ONEDNN_UKERNEL_ENABLED)
+  if (Brgemm::device_check(ScalarType::BFloat16)) {
+    Brgemm::execute<at::BFloat16, at::BFloat16, float>(
+      ghelper, A, B, C);
+    return;
+  }
+#endif
+  TORCH_CHECK(false,
+  "BFloat16 Brgemm is only supported on X64 when oneDNN ukernel is enabled and avx512 is supported");
 }
 
 } // namespace at::native::cpublas
