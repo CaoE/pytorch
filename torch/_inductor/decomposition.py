@@ -962,8 +962,7 @@ def index_reduce(
     )
 
 
-@register_decomposition(aten.max_pool2d_with_indices)
-def max_pool2d_with_indices(
+def max_pool2d_forward(
     x: torch.Tensor,
     kernel_size: list[int],
     stride: Optional[Union[int, list[int]]] = None,
@@ -1003,6 +1002,7 @@ def max_pool2d_with_indices(
         dilation,
         ceil_mode,
     )
+
     indices = prims._low_memory_max_pool2d_offsets_to_indices(
         offsets,
         kernel_size[1],
@@ -1011,6 +1011,34 @@ def max_pool2d_with_indices(
         padding,
     )
     return vals, indices
+
+
+@register_decomposition(aten.max_pool2d)
+def max_pool2d(
+    x: torch.Tensor,
+    kernel_size: list[int],
+    stride: Optional[Union[int, list[int]]] = None,
+    padding: Union[int, list[int]] = 0,
+    dilation: Union[int, list[int]] = 1,
+    ceil_mode: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return max_pool2d_forward(
+        x, kernel_size, stride, padding, dilation, ceil_mode
+    )
+
+
+@register_decomposition(aten.max_pool2d_with_indices)
+def max_pool2d_with_indices(
+    x: torch.Tensor,
+    kernel_size: list[int],
+    stride: Optional[Union[int, list[int]]] = None,
+    padding: Union[int, list[int]] = 0,
+    dilation: Union[int, list[int]] = 1,
+    ceil_mode: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return max_pool2d_forward(
+        x, kernel_size, stride, padding, dilation, ceil_mode
+    )
 
 
 @register_decomposition(aten.adaptive_max_pool2d)

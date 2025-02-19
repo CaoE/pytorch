@@ -80,6 +80,7 @@ inductor_fallback_ops = {
     "aten.masked_select.default",
     "aten.masked_scatter.default",
     "aten.masked_scatter_backward.default",
+    "aten.max_pool2d.default",
     "aten.max_pool2d_with_indices_backward.default",
     "aten.max_pool2d_with_indices.default",
     "aten.max_pool3d_with_indices.default",
