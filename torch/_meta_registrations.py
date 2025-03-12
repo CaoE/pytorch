@@ -3414,11 +3414,7 @@ def meta_index_Tensor(self, indices):
         # No need to worry about the output strides if self is empty.
         return out
 
-    # Try to follow eager to decide the output stride based on self.
-    # Note that perm here is the reverse of the 'perm_' decided by
-    # TensorIteratorBase::reorder_dimensions
-    restrided_self = _restride_src(self)
-    perm = utils.compute_elementwise_output_logical_to_physical_perm(restrided_self)
+    perm = utils.compute_elementwise_output_logical_to_physical_perm(self)
 
     # Follow TensorIteratorBase::allocate_or_resize_outputs
     if list(perm) != list(range(len(perm))):
