@@ -28,6 +28,9 @@
 // #include <ATen/ops/all.h>
 #endif
 
+#include <oneapi/dnnl/dnnl.hpp>
+#include <oneapi/dnnl/dnnl_graph.hpp>
+
 namespace at::native {
 
 namespace {
@@ -798,6 +801,7 @@ sdpa_int8_kernel_one_loop_impl(
     float a_scale,
     int64_t o_zp,
     float o_scale) {
+      printf("sdpa_int8_kernel_one_loop_impl\n");
   // Query (Batch x Num_heads  x Q_seq_len  x Dim_per_head)
   //    -> (Batch x Q_seq_len  x Num_heads  x Dim_per_head)
   // Key   (Batch x Num_heads  x KV_seq_len x Dim_per_head)
@@ -1407,6 +1411,7 @@ sdpa_int8_kernel_several_loops_impl(
     float a_scale,
     int64_t o_zp,
     float o_scale) {
+      printf("sdpa_int8_kernel_several_loops_impl\n");
   // Query (Batch x Num_heads  x Q_seq_len  x Dim_per_head)
   //    -> (Batch x Q_seq_len  x Num_heads  x Dim_per_head)
   // Key   (Batch x Num_heads  x KV_seq_len x Dim_per_head)
@@ -1871,12 +1876,12 @@ sdpa_int8_kernel_several_loops_impl(
           at::ScalarType::Half, mask_t, __VA_ARGS__))
 
 void sdpa_int8_fused_kernel(
-    at::Tensor& output,
+    at::Tensor& origin_output, // origin_output
     const at::Tensor& query,
     const at::Tensor& key,
     const at::Tensor& value,
     std::optional<Tensor> attn_mask,
-    std::optional<double> scale,
+    std::optional<double> origin_scale, //origin_scale
     double dropout_p,
     bool is_causal,
     int64_t q_zp,
@@ -1889,11 +1894,13 @@ void sdpa_int8_fused_kernel(
     double a_scale,
     int64_t o_zp,
     double o_scale) {
+  // printf("sdpa_int8_fused_kernel\n");
   TORCH_CHECK(query.scalar_type() == c10::kByte);
   int64_t batchSize = query.size(0);
   int64_t num_head = query.size(1);
   int64_t q_seq_len = query.size(2);
   int64_t kv_seq_len = key.size(2);
+  int64_t head_size = query.size(3);
   int64_t q_split_size = 32;
   if (q_seq_len >= 768) {
     q_split_size = 256;
@@ -1904,133 +1911,310 @@ void sdpa_int8_fused_kernel(
   uint32_t l2_cache_size = at::cpu::L2_cache_size();
   int64_t num_thread = at::get_num_threads();
   int64_t attn_size = q_split_size * kv_seq_len * sizeof(int32_t) * num_thread;
-  bool use_one_parallel_loop = (batchSize * num_head > num_thread) &&
-      (attn_size > 1.5 * l2_cache_size);
-  if (use_one_parallel_loop) {
-    if (!attn_mask.has_value()) {
-      if (q_split_size == 256) {
-        sdpa_int8_kernel_one_loop_impl<unsigned char, float, 256, 64>(
-          output, query, key, value,
-          attn_mask, scale, dropout_p, is_causal,
-          q_zp, q_scale,
-          k_zp, k_scale,
-          v_zp, v_scale,
-          a_zp, a_scale,
-          o_zp, o_scale);
-      } else if (q_split_size == 64) {
-        sdpa_int8_kernel_one_loop_impl<unsigned char, float, 64, 64>(
-          output, query, key, value,
-          attn_mask, scale, dropout_p, is_causal,
-          q_zp, q_scale,
-          k_zp, k_scale,
-          v_zp, v_scale,
-          a_zp, a_scale,
-          o_zp, o_scale);
-      } else {
-        sdpa_int8_kernel_one_loop_impl<unsigned char, float, 32, 64>(
-          output, query, key, value,
-          attn_mask, scale, dropout_p, is_causal,
-          q_zp, q_scale,
-          k_zp, k_scale,
-          v_zp, v_scale,
-          a_zp, a_scale,
-          o_zp, o_scale);
-      }
-    } else {
-      AT_DISPATCH_MASK_TYPES(attn_mask.value().scalar_type(), "sdpa_mask", [&]() {
-        if (q_split_size == 256) {
-          sdpa_int8_kernel_one_loop_impl<unsigned char, mask_t, 256, 64>(
-            output, query, key, value,
-            attn_mask, scale, dropout_p, is_causal,
-            q_zp, q_scale,
-            k_zp, k_scale,
-            v_zp, v_scale,
-            a_zp, a_scale,
-            o_zp, o_scale);
-        } else if (q_split_size == 64) {
-          sdpa_int8_kernel_one_loop_impl<unsigned char, mask_t, 64, 64>(
-            output, query, key, value,
-            attn_mask, scale, dropout_p, is_causal,
-            q_zp, q_scale,
-            k_zp, k_scale,
-            v_zp, v_scale,
-            a_zp, a_scale,
-            o_zp, o_scale);
-        } else {
-          sdpa_int8_kernel_one_loop_impl<unsigned char, mask_t, 32, 64>(
-            output, query, key, value,
-            attn_mask, scale, dropout_p, is_causal,
-            q_zp, q_scale,
-            k_zp, k_scale,
-            v_zp, v_scale,
-            a_zp, a_scale,
-            o_zp, o_scale);
-        }
-      });
-    }
-  } else {
-    if (!attn_mask.has_value()) {
-      if (q_split_size == 256) {
-        sdpa_int8_kernel_several_loops_impl<unsigned char, float, 256, 64>(
-          output, query, key, value,
-          attn_mask, scale, dropout_p, is_causal,
-          q_zp, q_scale,
-          k_zp, k_scale,
-          v_zp, v_scale,
-          a_zp, a_scale,
-          o_zp, o_scale);
-      } else if (q_split_size == 64) {
-        sdpa_int8_kernel_several_loops_impl<unsigned char, float, 64, 64>(
-          output, query, key, value,
-          attn_mask, scale, dropout_p, is_causal,
-          q_zp, q_scale,
-          k_zp, k_scale,
-          v_zp, v_scale,
-          a_zp, a_scale,
-          o_zp, o_scale);
-      } else {
-        sdpa_int8_kernel_several_loops_impl<unsigned char, float, 32, 64>(
-          output, query, key, value,
-          attn_mask, scale, dropout_p, is_causal,
-          q_zp, q_scale,
-          k_zp, k_scale,
-          v_zp, v_scale,
-          a_zp, a_scale,
-          o_zp, o_scale);
-      }
-    } else {
-      AT_DISPATCH_MASK_TYPES(attn_mask.value().scalar_type(), "sdpa_mask", [&]() {
-        if (q_split_size == 256) {
-          sdpa_int8_kernel_several_loops_impl<unsigned char, mask_t, 256, 64>(
-            output, query, key, value,
-            attn_mask, scale, dropout_p, is_causal,
-            q_zp, q_scale,
-            k_zp, k_scale,
-            v_zp, v_scale,
-            a_zp, a_scale,
-            o_zp, o_scale);
-        } else if (q_split_size == 64) {
-          sdpa_int8_kernel_several_loops_impl<unsigned char, mask_t, 64, 64>(
-            output, query, key, value,
-            attn_mask, scale, dropout_p, is_causal,
-            q_zp, q_scale,
-            k_zp, k_scale,
-            v_zp, v_scale,
-            a_zp, a_scale,
-            o_zp, o_scale);
-        } else {
-          sdpa_int8_kernel_several_loops_impl<unsigned char, mask_t, 32, 64>(
-            output, query, key, value,
-            attn_mask, scale, dropout_p, is_causal,
-            q_zp, q_scale,
-            k_zp, k_scale,
-            v_zp, v_scale,
-            a_zp, a_scale,
-            o_zp, o_scale);
-        }
-      });
-    }
+
+  constexpr auto ekind = dnnl::engine::kind::cpu;
+  // dnnl::graph::allocator alloc = create_allocator(ekind);
+
+  //   // Create execution dnnl::engine.
+  //   dnnl::engine eng = make_engine_with_allocator(ekind, 0, alloc);
+  //   // Create dnnl::stream.
+  //   dnnl::stream strm(eng);
+  dnnl::engine eng(ekind, 0);
+  dnnl::stream strm(eng);
+
+  using logical_tensor = dnnl::graph::logical_tensor;
+  using layout_type = logical_tensor::layout_type;
+  using data_type = logical_tensor::data_type;
+  using dim = logical_tensor::dim;
+  using dims = logical_tensor::dims;
+  using op = dnnl::graph::op;
+  // Prepare input and output shapes to construct the sdpa graph.
+  const dnnl::graph::logical_tensor::dims qkv_sz = {batchSize, num_head, q_seq_len, head_size};
+  const dnnl::graph::logical_tensor::dims score_sz = {batchSize, num_head, q_seq_len, q_seq_len};
+  const dnnl::graph::logical_tensor::dims scale_sz = {1};
+  // const dnnl::graph::logical_tensor::dims mask_sz = {batchSize, 1, 1, q_seq_len};
+
+  // Incremental IDs used to create logical tensors and operations.
+  size_t id = 0;
+
+  // insert the dequant for u8 query to f32 query
+  auto q_u8
+          = dnnl::graph::logical_tensor(id++, data_type::u8, qkv_sz, layout_type::strided);
+  auto q_f32 = dnnl::graph::logical_tensor(
+          id++, data_type::f32, qkv_sz, layout_type::strided);
+  auto q_deq = dnnl::graph::op(id++, op::kind::Dequantize, "q_deq");
+  q_deq.set_attr<std::string>(op::attr::qtype, "per_tensor");
+  q_deq.set_attr<float>(op::attr::scales, q_scale);
+  q_deq.set_attr<int64_t>(op::attr::zps, q_zp);
+  q_deq.add_input(q_u8);
+  q_deq.add_output(q_f32);
+
+  // insert the dequant for u8 key to f32 key
+  auto k_u8
+          = logical_tensor(id++, data_type::u8, qkv_sz, layout_type::strided);
+  auto k_f32 = logical_tensor(
+          id++, data_type::f32, qkv_sz, layout_type::strided);
+  auto k_deq = op(id++, op::kind::Dequantize, "k_deq");
+  k_deq.set_attr<std::string>(op::attr::qtype, "per_tensor");
+  k_deq.set_attr<float>(op::attr::scales, k_scale);
+  k_deq.set_attr<int64_t>(op::attr::zps, k_zp);
+  k_deq.add_input(k_u8);
+  k_deq.add_output(k_f32);
+
+  // score = query x key.T.
+  auto score = logical_tensor(
+          id++, data_type::f32, score_sz, layout_type::strided);
+  auto bmm1 = op(id++, op::kind::MatMul, "bmm1");
+  bmm1.set_attr<bool>(op::attr::transpose_b, true);
+  bmm1.add_inputs({q_f32, k_f32});
+  bmm1.add_output(score);
+
+  // scaled_score = score / scale
+  auto scale = logical_tensor(
+          id++, data_type::f32, scale_sz, layout_type::strided);
+  auto scaled_score = logical_tensor(
+          id++, data_type::f32, score_sz, layout_type::strided);
+  auto scale_div = op(id++, op::kind::Divide, "scale_div");
+  scale_div.add_inputs({score, scale});
+  scale_div.add_outputs({scaled_score});
+
+  //// masked_score = scaled_score + mask
+  // auto mask = logical_tensor(
+  //         id++, data_type::f32, mask_sz, layout_type::strided);
+  // auto masked_score = logical_tensor(
+  //         id++, data_type::f32, score_sz, layout_type::strided);
+  // auto mask_add = op(id++, op::kind::Add, "mask_add");
+  // mask_add.add_inputs({scaled_score, mask});
+  // mask_add.add_outputs({masked_score});
+
+  // attention_probs = softmax(masked_score)
+  auto probs = logical_tensor(
+          id++, data_type::f32, score_sz, layout_type::strided);
+  auto softmax = op(id++, op::kind::SoftMax, "softmax");
+  softmax.set_attr<int64_t>(op::attr::axis, -1);
+  if (!attn_mask.has_value()) {
+    softmax.add_inputs({scaled_score});
   }
+
+  softmax.add_outputs({probs});
+
+  // quantize the probs from f32 to u8
+  auto probs_u8 = logical_tensor(
+          id++, data_type::u8, score_sz, layout_type::strided);
+  auto p_quant = op(id++, op::kind::Quantize, "p_quant");
+  p_quant.set_attr<std::string>(op::attr::qtype, "per_tensor");
+  p_quant.set_attr<float>(op::attr::scales, a_scale);
+  p_quant.set_attr<int64_t>(op::attr::zps, a_zp);
+  p_quant.add_input(probs);
+  p_quant.add_output(probs_u8);
+
+  // dequant the probs from u8 to f32
+  auto probs_f32 = logical_tensor(
+          id++, data_type::f32, score_sz, layout_type::strided);
+  auto p_deq = op(id++, op::kind::Dequantize, "p_deq");
+  p_deq.set_attr<std::string>(op::attr::qtype, "per_tensor");
+  p_deq.set_attr<float>(op::attr::scales, a_scale);
+  p_deq.set_attr<int64_t>(op::attr::zps, a_zp);
+  p_deq.add_input(probs_u8);
+  p_deq.add_output(probs_f32);
+
+  // dequant the value from u8 to f32
+  auto v_u8
+          = logical_tensor(id++, data_type::u8, qkv_sz, layout_type::strided);
+  auto v_f32 = logical_tensor(
+          id++, data_type::f32, qkv_sz, layout_type::strided);
+  auto v_deq = op(id++, op::kind::Dequantize, "v_deq");
+  v_deq.set_attr<std::string>(op::attr::qtype, "per_tensor");
+  v_deq.set_attr<float>(op::attr::scales, v_scale);
+  v_deq.set_attr<int64_t>(op::attr::zps, v_zp);
+  v_deq.add_input(v_u8);
+  v_deq.add_output(v_f32);
+
+  // attention_output = attention_probs x value.
+  auto output = logical_tensor(
+          id++, data_type::f32, qkv_sz, layout_type::strided);
+  auto bmm2 = op(id++, op::kind::MatMul, "bmm2");
+  bmm2.add_inputs({probs_f32, v_f32});
+  bmm2.add_outputs({output});
+
+  // quantize the output from f32 to u8
+  auto output_u8
+          = logical_tensor(id++, data_type::u8, qkv_sz, layout_type::strided);
+  auto o_quant = op(id++, op::kind::Quantize, "o_quant");
+  o_quant.set_attr<std::string>(op::attr::qtype, "per_tensor");
+  o_quant.set_attr<float>(op::attr::scales, o_scale);
+  o_quant.set_attr<int64_t>(op::attr::zps, o_zp);
+  o_quant.add_input(output);
+  o_quant.add_output(output_u8);
+
+  // Construct a sdpa graph with engine kind and operations.
+  dnnl::graph::graph sdpa(ekind);
+  sdpa.add_op(q_deq);
+  sdpa.add_op(k_deq);
+  sdpa.add_op(bmm1);
+  sdpa.add_op(scale_div);
+  // sdpa.add_op(mask_add);
+  sdpa.add_op(softmax);
+  sdpa.add_op(p_quant);
+  sdpa.add_op(p_deq);
+  sdpa.add_op(v_deq);
+  sdpa.add_op(bmm2);
+  sdpa.add_op(o_quant);
+  sdpa.finalize();
+
+  // Get partitions from the sdpa graph.
+  std::vector<dnnl::graph::partition> partitions = sdpa.get_partitions();
+  // This is just for oneDNN testing purpose.
+  if (partitions.size() != 1) {
+      std::cout << "unsupported sdpa" << std::endl;
+      return;
+  }
+
+  // Compile the partition with inputs, outputs, and an engine.
+  dnnl::graph::compiled_partition cp = partitions[0].compile(
+          {q_u8, k_u8, scale, v_u8}, {output_u8}, eng);
+  using accum_t = float;
+  accum_t scaling_factor = sdp::calculate_scale(query, origin_scale).expect_float();
+  std::vector<dnnl::graph::tensor> inputs;
+  inputs.reserve(4);
+  inputs.emplace_back(q_u8, eng, query.data_ptr());
+  inputs.emplace_back(k_u8, eng, key.data_ptr());
+  inputs.emplace_back(scale, eng, (void*)&scaling_factor);
+  inputs.emplace_back(v_u8, eng, value.data_ptr());
+
+  std::vector<dnnl::graph::tensor> outputs = {
+    {output_u8, eng, origin_output.data_ptr()},
+  };
+
+  cp.execute(strm, inputs, outputs);
+
+  // bool use_one_parallel_loop = (batchSize * num_head > num_thread) &&
+  //     (attn_size > 1.5 * l2_cache_size);
+  // if (use_one_parallel_loop) {
+  //   if (!attn_mask.has_value()) {
+  //     if (q_split_size == 256) {
+  //       sdpa_int8_kernel_one_loop_impl<unsigned char, float, 256, 64>(
+  //         output, query, key, value,
+  //         attn_mask, scale, dropout_p, is_causal,
+  //         q_zp, q_scale,
+  //         k_zp, k_scale,
+  //         v_zp, v_scale,
+  //         a_zp, a_scale,
+  //         o_zp, o_scale);
+  //     } else if (q_split_size == 64) {
+  //       sdpa_int8_kernel_one_loop_impl<unsigned char, float, 64, 64>(
+  //         output, query, key, value,
+  //         attn_mask, scale, dropout_p, is_causal,
+  //         q_zp, q_scale,
+  //         k_zp, k_scale,
+  //         v_zp, v_scale,
+  //         a_zp, a_scale,
+  //         o_zp, o_scale);
+  //     } else {
+  //       sdpa_int8_kernel_one_loop_impl<unsigned char, float, 32, 64>(
+  //         output, query, key, value,
+  //         attn_mask, scale, dropout_p, is_causal,
+  //         q_zp, q_scale,
+  //         k_zp, k_scale,
+  //         v_zp, v_scale,
+  //         a_zp, a_scale,
+  //         o_zp, o_scale);
+  //     }
+  //   } else {
+  //     AT_DISPATCH_MASK_TYPES(attn_mask.value().scalar_type(), "sdpa_mask", [&]() {
+  //       if (q_split_size == 256) {
+  //         sdpa_int8_kernel_one_loop_impl<unsigned char, mask_t, 256, 64>(
+  //           output, query, key, value,
+  //           attn_mask, scale, dropout_p, is_causal,
+  //           q_zp, q_scale,
+  //           k_zp, k_scale,
+  //           v_zp, v_scale,
+  //           a_zp, a_scale,
+  //           o_zp, o_scale);
+  //       } else if (q_split_size == 64) {
+  //         sdpa_int8_kernel_one_loop_impl<unsigned char, mask_t, 64, 64>(
+  //           output, query, key, value,
+  //           attn_mask, scale, dropout_p, is_causal,
+  //           q_zp, q_scale,
+  //           k_zp, k_scale,
+  //           v_zp, v_scale,
+  //           a_zp, a_scale,
+  //           o_zp, o_scale);
+  //       } else {
+  //         sdpa_int8_kernel_one_loop_impl<unsigned char, mask_t, 32, 64>(
+  //           output, query, key, value,
+  //           attn_mask, scale, dropout_p, is_causal,
+  //           q_zp, q_scale,
+  //           k_zp, k_scale,
+  //           v_zp, v_scale,
+  //           a_zp, a_scale,
+  //           o_zp, o_scale);
+  //       }
+  //     });
+  //   }
+  // } else {
+  //   if (!attn_mask.has_value()) {
+  //     if (q_split_size == 256) {
+  //       sdpa_int8_kernel_several_loops_impl<unsigned char, float, 256, 64>(
+  //         output, query, key, value,
+  //         attn_mask, scale, dropout_p, is_causal,
+  //         q_zp, q_scale,
+  //         k_zp, k_scale,
+  //         v_zp, v_scale,
+  //         a_zp, a_scale,
+  //         o_zp, o_scale);
+  //     } else if (q_split_size == 64) {
+  //       sdpa_int8_kernel_several_loops_impl<unsigned char, float, 64, 64>(
+  //         output, query, key, value,
+  //         attn_mask, scale, dropout_p, is_causal,
+  //         q_zp, q_scale,
+  //         k_zp, k_scale,
+  //         v_zp, v_scale,
+  //         a_zp, a_scale,
+  //         o_zp, o_scale);
+  //     } else {
+  //       sdpa_int8_kernel_several_loops_impl<unsigned char, float, 32, 64>(
+  //         output, query, key, value,
+  //         attn_mask, scale, dropout_p, is_causal,
+  //         q_zp, q_scale,
+  //         k_zp, k_scale,
+  //         v_zp, v_scale,
+  //         a_zp, a_scale,
+  //         o_zp, o_scale);
+  //     }
+  //   } else {
+  //     AT_DISPATCH_MASK_TYPES(attn_mask.value().scalar_type(), "sdpa_mask", [&]() {
+  //       if (q_split_size == 256) {
+  //         sdpa_int8_kernel_several_loops_impl<unsigned char, mask_t, 256, 64>(
+  //           output, query, key, value,
+  //           attn_mask, scale, dropout_p, is_causal,
+  //           q_zp, q_scale,
+  //           k_zp, k_scale,
+  //           v_zp, v_scale,
+  //           a_zp, a_scale,
+  //           o_zp, o_scale);
+  //       } else if (q_split_size == 64) {
+  //         sdpa_int8_kernel_several_loops_impl<unsigned char, mask_t, 64, 64>(
+  //           output, query, key, value,
+  //           attn_mask, scale, dropout_p, is_causal,
+  //           q_zp, q_scale,
+  //           k_zp, k_scale,
+  //           v_zp, v_scale,
+  //           a_zp, a_scale,
+  //           o_zp, o_scale);
+  //       } else {
+  //         sdpa_int8_kernel_several_loops_impl<unsigned char, mask_t, 32, 64>(
+  //           output, query, key, value,
+  //           attn_mask, scale, dropout_p, is_causal,
+  //           q_zp, q_scale,
+  //           k_zp, k_scale,
+  //           v_zp, v_scale,
+  //           a_zp, a_scale,
+  //           o_zp, o_scale);
+  //       }
+  //     });
+  //   }
+  // }
 }
 // #endif // CPU_CAPABILITY_AVX512
 
