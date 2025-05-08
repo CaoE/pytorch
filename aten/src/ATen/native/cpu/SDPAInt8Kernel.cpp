@@ -30,7 +30,10 @@
 
 #include <oneapi/dnnl/dnnl.hpp>
 #include <oneapi/dnnl/dnnl_graph.hpp>
+// #include <iostream>
+// #include <chrono>
 
+// typedef std::chrono::nanoseconds res;
 namespace at::native {
 
 namespace {
@@ -1894,6 +1897,9 @@ void sdpa_int8_fused_kernel(
     double a_scale,
     int64_t o_zp,
     double o_scale) {
+  static bool first = true;
+  static dnnl::graph::compiled_partition cp;
+  static dnnl::graph::partition partition;
   // printf("sdpa_int8_fused_kernel\n");
   TORCH_CHECK(query.scalar_type() == c10::kByte);
   int64_t batchSize = query.size(0);
@@ -1912,6 +1918,8 @@ void sdpa_int8_fused_kernel(
   int64_t num_thread = at::get_num_threads();
   int64_t attn_size = q_split_size * kv_seq_len * sizeof(int32_t) * num_thread;
 
+  static size_t q_id = 0, k_id = 0, v_id = 0, o_id = 0, scale_id = 0;
+
   constexpr auto ekind = dnnl::engine::kind::cpu;
   // dnnl::graph::allocator alloc = create_allocator(ekind);
 
@@ -1919,8 +1927,8 @@ void sdpa_int8_fused_kernel(
   //   dnnl::engine eng = make_engine_with_allocator(ekind, 0, alloc);
   //   // Create dnnl::stream.
   //   dnnl::stream strm(eng);
-  dnnl::engine eng(ekind, 0);
-  dnnl::stream strm(eng);
+  static dnnl::engine eng(ekind, 0);
+  static dnnl::stream strm(eng);
 
   using logical_tensor = dnnl::graph::logical_tensor;
   using layout_type = logical_tensor::layout_type;
@@ -1932,14 +1940,27 @@ void sdpa_int8_fused_kernel(
   const dnnl::graph::logical_tensor::dims qkv_sz = {batchSize, num_head, q_seq_len, head_size};
   const dnnl::graph::logical_tensor::dims score_sz = {batchSize, num_head, q_seq_len, q_seq_len};
   const dnnl::graph::logical_tensor::dims scale_sz = {1};
+  size_t id = 0;
+
+  static auto q_u8
+        = dnnl::graph::logical_tensor(id++, data_type::u8, qkv_sz, layout_type::strided);
+  static auto k_u8
+          = logical_tensor(id++, data_type::u8, qkv_sz, layout_type::strided);
+  static auto v_u8
+          = logical_tensor(id++, data_type::u8, qkv_sz, layout_type::strided);
+  static auto scale
+          = logical_tensor(id++, data_type::f32, scale_sz, layout_type::strided);
+  static auto output_u8
+          = logical_tensor(id++, data_type::u8, qkv_sz, layout_type::strided);
+  if (first) {
+  
   // const dnnl::graph::logical_tensor::dims mask_sz = {batchSize, 1, 1, q_seq_len};
 
   // Incremental IDs used to create logical tensors and operations.
-  size_t id = 0;
+  
 
   // insert the dequant for u8 query to f32 query
-  auto q_u8
-          = dnnl::graph::logical_tensor(id++, data_type::u8, qkv_sz, layout_type::strided);
+  
   auto q_f32 = dnnl::graph::logical_tensor(
           id++, data_type::f32, qkv_sz, layout_type::strided);
   auto q_deq = dnnl::graph::op(id++, op::kind::Dequantize, "q_deq");
@@ -1950,8 +1971,7 @@ void sdpa_int8_fused_kernel(
   q_deq.add_output(q_f32);
 
   // insert the dequant for u8 key to f32 key
-  auto k_u8
-          = logical_tensor(id++, data_type::u8, qkv_sz, layout_type::strided);
+  
   auto k_f32 = logical_tensor(
           id++, data_type::f32, qkv_sz, layout_type::strided);
   auto k_deq = op(id++, op::kind::Dequantize, "k_deq");
@@ -1970,8 +1990,9 @@ void sdpa_int8_fused_kernel(
   bmm1.add_output(score);
 
   // scaled_score = score / scale
-  auto scale = logical_tensor(
-          id++, data_type::f32, scale_sz, layout_type::strided);
+  // scale_id = id;
+  // auto scale = logical_tensor(
+  //         id++, data_type::f32, scale_sz, layout_type::strided);
   auto scaled_score = logical_tensor(
           id++, data_type::f32, score_sz, layout_type::strided);
   auto scale_div = op(id++, op::kind::Divide, "scale_div");
@@ -2019,8 +2040,9 @@ void sdpa_int8_fused_kernel(
   p_deq.add_output(probs_f32);
 
   // dequant the value from u8 to f32
-  auto v_u8
-          = logical_tensor(id++, data_type::u8, qkv_sz, layout_type::strided);
+  v_id = id;
+  // auto v_u8
+  //         = logical_tensor(id++, data_type::u8, qkv_sz, layout_type::strided);
   auto v_f32 = logical_tensor(
           id++, data_type::f32, qkv_sz, layout_type::strided);
   auto v_deq = op(id++, op::kind::Dequantize, "v_deq");
@@ -2038,8 +2060,9 @@ void sdpa_int8_fused_kernel(
   bmm2.add_outputs({output});
 
   // quantize the output from f32 to u8
-  auto output_u8
-          = logical_tensor(id++, data_type::u8, qkv_sz, layout_type::strided);
+  // o_id = id;
+  // auto output_u8
+  //         = logical_tensor(id++, data_type::u8, qkv_sz, layout_type::strided);
   auto o_quant = op(id++, op::kind::Quantize, "o_quant");
   o_quant.set_attr<std::string>(op::attr::qtype, "per_tensor");
   o_quant.set_attr<float>(op::attr::scales, o_scale);
@@ -2069,9 +2092,10 @@ void sdpa_int8_fused_kernel(
       std::cout << "unsupported sdpa" << std::endl;
       return;
   }
+  partition = partitions[0];
 
   // Compile the partition with inputs, outputs, and an engine.
-  dnnl::graph::compiled_partition cp = partitions[0].compile(
+  cp = partition.compile(
           {q_u8, k_u8, scale, v_u8}, {output_u8}, eng);
   using accum_t = float;
   accum_t scaling_factor = sdp::calculate_scale(query, origin_scale).expect_float();
@@ -2085,9 +2109,45 @@ void sdpa_int8_fused_kernel(
   std::vector<dnnl::graph::tensor> outputs = {
     {output_u8, eng, origin_output.data_ptr()},
   };
-
   cp.execute(strm, inputs, outputs);
-
+  // cp.execute(strm, inputs, outputs);
+  // cp.execute(strm, inputs, outputs);
+  // printf("first sdpa int8\n");
+  }
+  else {
+    // printf("next sdpa int8\n");
+    // auto q_u8
+    //       = dnnl::graph::logical_tensor(q_id, data_type::u8, qkv_sz, layout_type::strided);
+    // auto k_u8
+    //       = dnnl::graph::logical_tensor(k_id, data_type::u8, qkv_sz, layout_type::strided);
+    // auto v_u8
+    //       = dnnl::graph::logical_tensor(v_id, data_type::u8, qkv_sz, layout_type::strided);
+    // auto scale = logical_tensor(
+    //       scale_id, data_type::f32, scale_sz, layout_type::strided);
+    // auto output_u8
+    //       = logical_tensor(o_id, data_type::u8, qkv_sz, layout_type::strided);
+    
+    // cp = partition.compile(
+    //         {q_u8, k_u8, scale, v_u8}, {output_u8}, eng);
+    // auto t1 = std::chrono::high_resolution_clock::now();
+    using accum_t = float;
+    accum_t scaling_factor = sdp::calculate_scale(query, origin_scale).expect_float();
+    std::vector<dnnl::graph::tensor> inputs;
+    inputs.reserve(4);
+    inputs.emplace_back(q_u8, eng, query.data_ptr());
+    inputs.emplace_back(k_u8, eng, key.data_ptr());
+    inputs.emplace_back(scale, eng, (void*)&scaling_factor);
+    inputs.emplace_back(v_u8, eng, value.data_ptr());
+    std::vector<dnnl::graph::tensor> outputs = {
+      {output_u8, eng, origin_output.data_ptr()},
+    };
+    // auto t2 = std::chrono::high_resolution_clock::now();
+    // std::cout << "pre2: " << std::chrono::duration_cast<res>(t2 - t1).count() << "ns\n";
+    cp.execute(strm, inputs, outputs);
+  }
+  if (first) {
+    first = false;
+  }
   // bool use_one_parallel_loop = (batchSize * num_head > num_thread) &&
   //     (attn_size > 1.5 * l2_cache_size);
   // if (use_one_parallel_loop) {
