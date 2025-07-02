@@ -53,7 +53,7 @@ class CppMicroGemm:
 
     # TODO(jgong5): support constant shapes and lds as template args.
     DECLARE_KERNEL = r"""
-template <bool accum, bool horizontal_transverse, bool prefetch=false>
+template <bool accum, bool horizontal_transverse=false, bool prefetch=false>
 inline void {{kernel_name}}(
 {%- if kernel_extra_args_declare %}
     {{kernel_extra_args_declare}}
@@ -1834,46 +1834,43 @@ inline bool {{kernel_name}}_is_block_start(int index, int k_start, int group_siz
     for (int64_t n = 0; n < N; n += {{block_n}}) {
         // Dequantize K * block_n int8 B elements into BF16
         dequantize_B(n);
-        // for woq int4, block_n is 64, which is too large for micro kernel
-        for (int64_t ni = 0; ni < {{block_n}}; ni += 32) {
-            for (int64_t m = 0; m < M; m += {{block_m}}) {
-                int64_t block_m = std::min<int64_t>(M - m, {{block_m}});
-                int64_t m_tail = m;
-            {%- for num_rows in range(block_m, 0, -16) %}
-                {%- if num_rows != block_m %}
-                else
-            {%- endif %}
-                if (block_m >= {{num_rows}}) {
-                    {{kernel_name}}_amx_kernel_{{num_rows}}_{{num_columns}}<accum>(
-                        amx_state,
-                        A + m * lda,
-                        dequantized_B_buf + ni * K,
-                        C + m * ldc + n + ni,
-                        K,
-                        lda,
-                        updated_ldb,
-                        ldc,
-                        16
-                    );
-                    block_m -= {{num_rows}};
-                    m_tail += {{num_rows}};
-                }
-            {%- endfor %}
-                if (block_m > 0) {
-                    {{kernel_name}}_amx_kernel_16_{{num_columns}}<accum>(
-                        amx_state,
-                        A + m_tail * lda,
-                        dequantized_B_buf + ni * K,
-                        C + m_tail * ldc + n + ni,
-                        K,
-                        lda,
-                        updated_ldb,
-                        ldc,
-                        block_m
-                    );
-                }
-            } // for m
-        } // for ni
+        for (int64_t m = 0; m < M; m += {{block_m}}) {
+            int64_t block_m = std::min<int64_t>(M - m, {{block_m}});
+            int64_t m_tail = m;
+        {%- for num_rows in range(block_m, 0, -16) %}
+            {%- if num_rows != block_m %}
+            else
+        {%- endif %}
+            if (block_m >= {{num_rows}}) {
+                {{kernel_name}}_amx_kernel_{{num_rows}}_{{num_columns}}<accum, horizontal_transverse>(
+                    amx_state,
+                    A + m * lda,
+                    dequantized_B_buf + n * K,
+                    C + m * ldc + n,
+                    K,
+                    lda,
+                    {{block_n}},
+                    ldc,
+                    16
+                );
+                block_m -= {{num_rows}};
+                m_tail += {{num_rows}};
+            }
+        {%- endfor %}
+            if (block_m > 0) {
+                {{kernel_name}}_amx_kernel_16_{{num_columns}}<accum, horizontal_transverse>(
+                    amx_state,
+                    A + m_tail * lda,
+                    dequantized_B_buf + n * K,
+                    C + m_tail * ldc + n,
+                    K,
+                    lda,
+                    {{block_n}},
+                    ldc,
+                    block_m
+                );
+            }
+        } // for m
     } // for n
 }
 """
