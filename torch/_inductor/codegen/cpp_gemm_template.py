@@ -218,8 +218,20 @@ GEMM_TEMPLATE = r"""
     {%- set acc_buf_name = "local_acc_buf" %}
         {{ kernel.define_buffer(acc_buf_name, ["Mc_blocks*Mr", "Nc_blocks*Nr"], acc_buf_dtype) }}
 {%- endif %}
+        //if (tid == 44) {
+        //    std::cout << "m_block_start: " << m_block_start << std::endl;
+        //    std::cout << "m_block_end: " << m_block_end << std::endl;
+        //    std::cout << "num_Mc_blocks_per_thread: " << num_Mc_blocks_per_thread << std::endl;
+        //}
+        
         for (int64_t mc_block_id = 0; mc_block_id < num_Mc_blocks_per_thread; mc_block_id++) {
             {{ template.codegen_m_loop_params()|indent(12, false) }}
+            //if (tid == 44) {
+            //    std::cout << "mc: " << mc << std::endl;
+            //    std::cout << "m_start: " << m_start << std::endl;
+            //    std::cout << "m_end: " << m_end << std::endl;
+            //    std::cout << "m_size: " << m_size << std::endl;
+            //}
             for (int64_t nc = n_block_start; nc < n_block_end; nc += Nc_blocks) {
                 {{ template.codegen_n_loop_params()|indent(16, false) }}
 {%- if use_local_acc %}
@@ -1564,6 +1576,9 @@ class CppGemmTemplate(CppTemplate):
         epilogue_nodes: Optional[list[ir.IRNode]] = None,
         **kwargs,
     ) -> str:
+        kernel.m = self.m
+        kernel.n = self.n
+        kernel.k = self.k
         options = self.get_options(
             kernel=kernel,
             template_buffer_node=template_buffer_node,
@@ -1587,7 +1602,11 @@ class CppGemmTemplate(CppTemplate):
                 template_str = SMALL_M_GEMM_TEMPLATE
             else:
                 template_str = GEMM_TEMPLATE
-            return self._template_from_string(template_str).render(**options)
+            _template_from_string = self._template_from_string(template_str).render(**options)
+            # print("_template_from_string: ", _template_from_string)
+            # import pdb
+            # pdb.set_trace()
+            return _template_from_string
 
     def codegen_blocks(
         self,

@@ -352,6 +352,10 @@ class CppGroupedGemmTemplate(CppGemmTemplate):
         epilogue_nodes: Optional[list[ir.IRNode]] = None,
         **kwargs,
     ) -> str:
+        kernel.m = self.m
+        kernel.n = self.n
+        kernel.k = self.k
+        kernel.gemm_grouped_num = self.gemm_grouped_num
         assert self.act_mapping
         act_deduplicated = get_deduplicated_act(self.act_mapping)
         wgt_start_idx = len(act_deduplicated)

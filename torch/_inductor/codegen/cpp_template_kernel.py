@@ -186,6 +186,14 @@ class CppTemplateKernel(CppKernel):
     def maybe_codegen_profile(self) -> str:
         if config.cpp.enable_kernel_profile:
             graph_id = V.graph.graph_id
+            # print("self.kernel_name: ", self.kernel_name)
+            if hasattr(self, "m") and hasattr(self, "n") and hasattr(self, "k"):
+            #     import pdb
+            #     pdb.set_trace()
+                new_prefix = "graph_" + str(graph_id) + "_" + "m{}".format(self.m) + "_n{}".format(self.n) + "_k{}_".format(self.k) if graph_id is not None else ""
+                if hasattr(self, "gemm_grouped_num"):
+                    new_prefix += "g{}_".format(self.gemm_grouped_num)
+                self.new_record_name = f"{new_prefix}{self.kernel_name}"
             prefix = "graph_" + str(graph_id) + "_" if graph_id is not None else ""
             return f'RECORD_FUNCTION("{prefix}{self.kernel_name}", c10::ArrayRef<c10::IValue>({{}}));'
         else:

@@ -386,6 +386,9 @@ def register_onednn_fusion_ops():
                 layout,
                 input_gen_fns=input_gen_fns,
             )
+            # import pdb
+            # pdb.set_trace()
+
             if len(x_size) > 2:
                 result = view(result, (*x_size[:-1], result.get_size()[-1]))
             return result

@@ -5125,6 +5125,9 @@ class CppScheduling(BaseScheduling):
             flag_template_buffer_has_other_users=flag_template_buffer_has_other_users,
             epilogue_nodes=epilogue_ir_nodes,
         )
+        new_function_record_name = None
+        if hasattr(kernel, "new_record_name"):
+            new_function_record_name = kernel.new_record_name
         with kernel:
             if not is_multi_outputs_template(template_node.node):
                 template_node.mark_run()  # type: ignore[attr-defined]
@@ -5134,7 +5137,7 @@ class CppScheduling(BaseScheduling):
 
         with V.set_kernel_handler(kernel):
             node_schedule = [template_node, *epilogue_nodes]
-            kernel_name = self.define_kernel(src_code, node_schedule, kernel.args)
+            kernel_name = self.define_kernel(src_code, node_schedule, kernel.args, new_function_record_name)
 
         if is_multi_outputs_template(template_node.node):
             # For multi outputs template, allocate buffers for each output after the epilogue
@@ -5164,7 +5167,7 @@ class CppScheduling(BaseScheduling):
     def codegen_sync(self):
         pass
 
-    def define_kernel(self, src_code, nodes, kernel_args=None):
+    def define_kernel(self, src_code, nodes, kernel_args=None, new_kernel_name=None):
         wrapper = V.graph.wrapper_code
         fused_name = (
             get_fused_kernel_name(nodes, config.cpp.descriptive_names)
@@ -5177,8 +5180,24 @@ class CppScheduling(BaseScheduling):
             set_kernel_post_grad_provenance_tracing(nodes, kernel_name)
 
         kernel_decl_name = kernel_name if V.graph.cpp_wrapper else "kernel"
+        # record function name for profiling
+        if new_kernel_name:
+            def replace_record_function_name(src_code, new_kernel_name):
+                import re
+                # Match the actual pattern that appears in the source
+                # Look for 'RECORD_FUNCTION("graph_X_' followed by any text until the next quote
+                pattern = r'(RECORD_FUNCTION\(\s*"graph_\d+_)([^"]+)("\s*,)'
+                
+                # Replace everything between the graph prefix and the closing quote
+                updated_code = re.sub(pattern, f'\\1{new_kernel_name}\\3', src_code)
+                # print("updated_code: ", updated_code)
+                return updated_code
+
+            src_code = replace_record_function_name(src_code, new_kernel_name)
         src_code = src_code.replace(str(Placeholder.KERNEL_NAME), kernel_decl_name)
         src_code = src_code.replace(str(Placeholder.DESCRIPTIVE_NAME), kernel_name)
+        # if new_kernel_name:
+        #     print("replaced code: ", src_code)
         # TODO(voz): Ostensibly, we should not need this. But there are cases where C++ codegen does
         # not use BracesBuffer, so we have no good indicator of a C++ buffer atm.
         src_code = src_code.replace("#pragma CMT", "//")
