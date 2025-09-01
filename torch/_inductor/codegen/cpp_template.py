@@ -95,15 +95,15 @@ class CppTemplate(KernelTemplate):
             flag_template_buffer_has_other_users: bool,
             epilogue_nodes: Optional[list[ir.IRNode]] = None,
         ):
-            if new_record_name:
-                print("1 make_kernel_render new_record_name: ", new_record_name)
+            # if new_record_name:
+                # print("1 make_kernel_render new_record_name: ", new_record_name)
             kernel = CppTemplateKernel(
                 kernel_name=str(Placeholder.KERNEL_NAME), num_threads=self.num_threads
             )
             if new_record_name:
                 kernel.new_record_name = new_record_name
-            if new_record_name:
-                print("2 make_kernel_render new_record_name: ", kernel.new_record_name)
+            # if new_record_name:
+                # print("2 make_kernel_render new_record_name: ", kernel.new_record_name)
             render = functools.partial(
                 kernel.render,
                 self,
@@ -112,8 +112,8 @@ class CppTemplate(KernelTemplate):
                 epilogue_nodes=epilogue_nodes,
                 **kwargs,
             )
-            if new_record_name:
-                print("3 make_kernel_render new_record_name: ", kernel.new_record_name)
+            # if new_record_name:
+                # print("3 make_kernel_render new_record_name: ", kernel.new_record_name)
             return kernel, render
 
         return CppTemplateCaller(
@@ -134,6 +134,7 @@ class CppTemplate(KernelTemplate):
         # TODO: add c10::ForcedUnroll test to test_aoti_abi_check
         res.splice("""#include <c10/util/Unroll.h>""")
         res.splice("""#include <torch/csrc/inductor/aoti_torch/c/shim.h>""")
+        # res.splice("""#include <ATen/Context.h>""")
         enable_kernel_profile = config.cpp.enable_kernel_profile and sys.platform in [
             "linux",
             "win32",

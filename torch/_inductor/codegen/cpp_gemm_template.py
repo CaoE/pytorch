@@ -204,7 +204,7 @@ extern "C" {{export_declaration}}
 GEMM_TEMPLATE = r"""
 {{ template.codegen_gemm_stub_def() }}
 {
-    {{ kernel.maybe_codegen_profile() }}
+    {{ kernel.maybe_codegen_profile(template.get_kernel_prefix_name()) }}
     {{ template.codegen_blocks(
         num_threads, N, K, micro_gemm, is_dynamic_M, kernel, GemmOut, config, L1_cache_size, L2_cache_size, X, W
     ) }}
@@ -381,6 +381,19 @@ GEMM_TEMPLATE = r"""
                             for (int64_t n = 0; n < n_size; n++) {
                                 {{acc_buf_name}}[m*Nr + n] += other_acc[m*Nr + n];
                             }
+                            //auto nvec_size = n_size - n_size % 16;
+                            //for (int64_t n = 0; n < nvec_size; n+=16) {
+                            //    at::vec::Vectorized<float> acc_vec = at::vec::Vectorized<float>::loadu({{acc_buf_name}} + m*Nr + n);
+                            //    at::vec::Vectorized<float> other_vec = at::vec::Vectorized<float>::loadu(other_acc + m*Nr + n);
+                            //    acc_vec = acc_vec + other_vec;
+                            //    acc_vec.store({{acc_buf_name}} + m*Nr + n);
+                            //}
+                            //if (nvec_size < n_size) {
+                            //    at::vec::Vectorized<float> acc_vec = at::vec::Vectorized<float>::loadu({{acc_buf_name}} + m*Nr + nvec_size, n_size - nvec_size);
+                            //    at::vec::Vectorized<float> other_vec = at::vec::Vectorized<float>::loadu(other_acc + m*Nr + nvec_size, n_size - nvec_size);
+                            //    acc_vec = acc_vec + other_vec;
+                            //    acc_vec.store({{acc_buf_name}} + m*Nr + nvec_size, n_size - nvec_size);
+                            //}
                         }
                     }
     {%- set tile_acc_m_slice = kernel.slice_nd(tile_acc, [("m_offset", "m_offset + m_end - m_start"), ()]) %}
@@ -733,6 +746,7 @@ class CppGemmTemplate(CppTemplate):
         m_blocks = math.ceil(self.m / register_blocking.block_m)
         n_blocks = math.ceil(self.n / register_blocking.block_n)
         k_blocks = math.ceil(self.k / register_blocking.block_k)
+        # print("m_blocks: ", m_blocks, "n_blocks: ", n_blocks, "k_blocks: ", k_blocks)
         factors = get_factors(num_threads)
         assert len(factors) > 0
 
@@ -753,6 +767,13 @@ class CppGemmTemplate(CppTemplate):
                 block_n_size = blocking.block_n * register_blocking.block_n
                 best_block_m_size = best_blocking.block_m * register_blocking.block_m
                 best_block_n_size = best_blocking.block_n * register_blocking.block_n
+                workload_ratio = m_blocks * n_blocks * k_blocks / (blocking.block_k * blocking.block_n * blocking.block_m * self.num_threads)
+                best_workload_ratio = (
+                    m_blocks * n_blocks * k_blocks
+                    / (best_blocking.block_k * best_blocking.block_n * best_blocking.block_m * self.num_threads)
+                )
+
+
                 if blocking.block_k > best_blocking.block_k:
                     best_blocking = blocking
                 elif (
@@ -761,6 +782,18 @@ class CppGemmTemplate(CppTemplate):
                     < best_block_m_size + best_block_n_size
                 ):
                     best_blocking = blocking
+                # print("blocking: ", blocking, "best_blocking: ", best_blocking)
+                # # print("workload_ratio: ", 1.0 * workload_ratio, "best_workload_ratio: ", 1.0 * best_workload_ratio)
+                # print("workload_ratio / best_workload_ratio - 1 : ", 1.0 * workload_ratio / best_workload_ratio - 1)
+                # print("0.16 * best_blocking.block_k / blocking.block_k: ", 0.16 * best_blocking.block_k / blocking.block_k)
+                # if workload_ratio / best_workload_ratio - 1 > 0.16 * best_blocking.block_k / blocking.block_k:
+                #     best_blocking = blocking
+                # elif (
+                #     blocking.block_k == best_blocking.block_k
+                #     and block_m_size + block_n_size
+                #     < best_block_m_size + best_block_n_size
+                # ):
+                #     best_blocking = blocking
             return best_blocking
 
         best_blocking = None
@@ -802,7 +835,10 @@ class CppGemmTemplate(CppTemplate):
                     )
                     best_blocking = get_better_blocking(blocking, best_blocking)
 
+        # pdb.set_trace()
         assert best_blocking is not None
+        # best_blocking = GemmBlocking(1, 3, 64)
+        # print("best_blocking: ", best_blocking)
         return best_blocking
 
     def make_cache_blocking_cache(self):
@@ -888,10 +924,10 @@ class CppGemmTemplate(CppTemplate):
                 Kc_blocks = Kt_blocks
                 if size_cache_B > L1:
                     Kc_blocks = math.floor(L1 / (Kr * Nr * num_byte_B))
+                    # print("----- Kc_blocks: ", Kc_blocks)
 
                 if (
-                    config.cpp.use_small_dequant_buffer
-                    and dtype_A is torch.bfloat16
+                    dtype_A is torch.bfloat16
                     and dtype_B is torch.uint8
                     and Mt_blocks == 1
                 ):
@@ -906,6 +942,7 @@ class CppGemmTemplate(CppTemplate):
                 assert min_Mc_blocks >= 1
                 Kt_bytes = Kt_blocks * Kr * num_byte_A
                 if min_Mc_blocks * Mr * Kt_bytes < L2:
+                    # print("-----L2 / (Mr * Kt_bytes): ", L2 / (Mr * Kt_bytes))
                     # Strategy 1: A (Mc x Kt) resides in L2 and reused by all Nt
                     # when Nc_blocks is kept 1. Mc should be large enough (>= min_Mc_blocks)
                     # to reuse B (Kc x Nr) in L1. This makes C (Mc x Nr) small enough to reside
@@ -913,6 +950,7 @@ class CppGemmTemplate(CppTemplate):
                     Mc_blocks = min(Mt_blocks, math.floor(L2 / (Mr * Kt_bytes)))
                     Nc_blocks = 1
                 else:
+                    # print("==============================")
                     # Strategy 2: Kt is too large to hold A (Mc x Kt) in L2, we reuse
                     # A (Mc x Kc) in L2 by B (Kc x Nc). C (Mc x Nc) resides in L2.
                     Mc_blocks = Mt_blocks
@@ -1010,12 +1048,17 @@ class CppGemmTemplate(CppTemplate):
                 ):
                     Mc_blocks, Nc_blocks, Kc_blocks = _Mc_blocks, _Nc_blocks, _Kc_blocks
                     horizontal_transverse = True
+                # if self.m == 1:
+                #     horizontal_transverse = True
+                #     Mc_blocks, Nc_blocks, Kc_blocks = _Mc_blocks, _Nc_blocks, _Kc_blocks
             elif _use_cpp_gemm_strategy("VERTICAL"):
                 (
                     Mc_blocks,
                     Nc_blocks,
                     Kc_blocks,
                 ) = _get_cache_block_of_vertical_transverse()
+                # ) = _get_cache_block_of_horizontal_transverse() if self.m == 1 else _get_cache_block_of_vertical_transverse()
+                # print("-------------------HORIZONTAL-------------")
             else:
                 assert _use_cpp_gemm_strategy("HORIZONTAL")
                 (
@@ -1025,6 +1068,8 @@ class CppGemmTemplate(CppTemplate):
                 ) = _get_cache_block_of_horizontal_transverse()
                 horizontal_transverse = True
 
+            # Kc_blocks = 16
+            # print("Mc_blocks: ", Mc_blocks, "Nc_blocks: ", Nc_blocks, "Kc_blocks: ", Kc_blocks)
             return (
                 GemmBlocking(Mc_blocks, Nc_blocks, Kc_blocks),
                 value_to_cpp(horizontal_transverse, "bool"),
@@ -1323,10 +1368,30 @@ class CppGemmTemplate(CppTemplate):
         _, block_n, _ = micro_gemm.register_blocking
         new_size, padded_n = cls.get_padded_size(n, block_n, k, should_block_weight)
         padding = padded_n - n
+        m = inputs[0].get_size()[0] if isinstance(inputs[0], ir.IRNode) else inputs[0].shape[0]
+        keep_n_first = False
+        # if m == 1:
+        #     # For GEMV, we always keep [N, k] for weight
+        #     keep_n_first = True
 
         if should_block_weight:
-            blocked_w = cls.block_weight(W, new_size, padding)
-            new_inputs[1] = cls.pack_vnni_weight(blocked_w, micro_gemm, new_size)
+            blocked_w = cls.block_weight(W, new_size, padding, keep_n_first)
+            if keep_n_first:
+                if isinstance(blocked_w, ir.IRNode):
+                    if isinstance(blocked_w, ir.Buffer) and blocked_w.get_name() in V.graph.constants:
+                        new_inputs[1] = blocked_w
+                    else:
+                        k = new_size[-1]
+                        if not isinstance(blocked_w, ir.TensorBox):
+                            blocked_w = ir.TensorBox(blocked_w)
+                        blocked_w = ir.ExternKernel.realize_input(blocked_w)
+                        blocked_w = ir.ExternKernel.require_contiguous(blocked_w)
+                        new_inputs[1] = blocked_w
+                else:
+                    new_inputs[1] = blocked_w
+
+            else:
+                new_inputs[1] = cls.pack_vnni_weight(blocked_w, micro_gemm, new_size)
         elif isinstance(W, ir.IRNode):
             # Require W layout to be fixed & contiguous, happens inplace.
             ir.ExternKernel.require_contiguous(W)
@@ -1384,18 +1449,28 @@ class CppGemmTemplate(CppTemplate):
         return True
 
     @classmethod
-    def block_weight(cls, W, new_size, padding):
+    def block_weight(cls, W, new_size, padding, keep_n_first=False):
         # These are separated into two methods to allow subclasses to override them separately
         if isinstance(W, ir.IRNode):
             if W.get_name() in V.graph.constants:
                 # Create a new buffer, representing the constant blocked tensor
+                blocked_w_size = new_size
+                blocked_w_stride = ir.FlexibleLayout.contiguous_strides(blocked_w_size)
+                if keep_n_first:
+                    blocked_w_size = new_size
+                    blocked_w_size[-2], blocked_w_size[-1] = blocked_w_size[-1], blocked_w_size[-2]
+                    blocked_w_stride = ir.FlexibleLayout.contiguous_strides(blocked_w_size)
+                    blocked_w_size[-2], blocked_w_size[-1] = blocked_w_size[-1], blocked_w_size[-2]
+                    blocked_w_stride[-2], blocked_w_stride[-1] = blocked_w_stride[-1], blocked_w_stride[-2]
+
+
                 blocked_w = ir.Buffer(
                     name=W.get_name(),  # Borrow the registered buffer name
                     layout=ir.FixedLayout(
                         W.get_device_or_error(),
                         W.get_dtype(),
-                        new_size,
-                        ir.FlexibleLayout.contiguous_strides(new_size),
+                        blocked_w_size,
+                        blocked_w_stride,
                         0,
                     ),
                 )
@@ -1415,13 +1490,22 @@ class CppGemmTemplate(CppTemplate):
             assert isinstance(W, torch.Tensor)
             # Pad the weight tensor and reshape it into a 3D blocked shape
             blocked_size = list(new_size)
-            blocked_size[-2], blocked_size[-3] = blocked_size[-3], blocked_size[-2]
-            blocked_w = (
-                torch.nn.functional.pad(W, (0, padding))  # type: ignore[assignment]
-                .reshape(*blocked_size)
-                .transpose(-3, -2)
-                .contiguous()
-            )
+            if keep_n_first:
+                blocked_size[-2], blocked_size[-3] = blocked_size[-3], blocked_size[-2]
+                blocked_w = (
+                    torch.nn.functional.pad(W, (0, padding))  # type: ignore[assignment]
+                    .reshape(*blocked_size)
+                    .transpose(-3, -2)
+                    # .contiguous()
+                )
+            else:
+                blocked_size[-2], blocked_size[-3] = blocked_size[-3], blocked_size[-2]
+                blocked_w = (
+                    torch.nn.functional.pad(W, (0, padding))  # type: ignore[assignment]
+                    .reshape(*blocked_size)
+                    .transpose(-3, -2)
+                    .contiguous()
+                )
         return blocked_w
 
     @classmethod
@@ -1754,6 +1838,9 @@ class CppGemmTemplate(CppTemplate):
             and X.get_dtype() is torch.bfloat16
             and W.get_dtype() is torch.int8
         )
+
+    def get_kernel_prefix_name(self):
+        return "m{}".format(self.m) + "_n{}".format(self.n) + "_k{}".format(self.k)
 
     def render(  # type: ignore[override, return]
         self,

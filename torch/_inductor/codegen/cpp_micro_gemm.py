@@ -137,7 +137,7 @@ inline void {{kernel_name}}(
         C: ir.Buffer,
         accum: bool,
         horizontal_transverse: bool = False,
-        prefetch: bool = False,
+        prefetch: bool = True,
         **kwargs_for_extra_args,
     ) -> str:
         """
@@ -151,6 +151,9 @@ inline void {{kernel_name}}(
         N = kernel.size(C, 1)
         K = kernel.size(A, 1)
         lda = kernel.stride(A, 0)
+        # print("kernel.stride(B, 0): ", kernel.stride(B, 0))
+        # print("kernel.stride(B, 1): ", kernel.stride(B, 1))
+        # print("kernel.stride(B, 2): ", kernel.stride(B, 2))
         ldb = kernel.stride(B, 0)
         ldc = kernel.stride(C, 0)
         res = IndentedBuffer()
@@ -339,6 +342,208 @@ def do_not_use_with_small_m_for_int8_woq(config, m, n, k, alpha, num_threads, **
     return not check_int8_woq_small_m_dim(config, m, n, k, alpha, num_threads, **kwargs)
 
 
+
+# ###############################################################################
+# ###############################################################################
+# def is_small_m_dim_corner_case(config, m, n, k, alpha, num_threads, **kwargs):
+#     return (
+#         k % config.register_blocking.block_k == 0
+#         and n % config.register_blocking.block_n == 0
+#         and m == 1
+#     )
+
+# @register_micro_gemm(
+#     *generate_gemm_config(
+#         VecAVX512,
+#         [(8, 48, 1), (8, 32, 1), (16, 16, 1)],
+#         input_dtype=torch.bfloat16,
+#         output_dtype=torch.float,
+#         extra_check=is_small_m_dim_corner_case
+#     ),
+#     *generate_gemm_config(
+#         VecAVX512,
+#         [(8, 48, 1), (8, 32, 1), (16, 16, 1)],
+#         input_dtype=torch.half,
+#         output_dtype=torch.float,
+#         extra_check=is_small_m_dim_corner_case
+#     ),
+# )
+# class CppMicroGemmFP32VecSmall(CppMicroGemm):
+#     """
+#     This class generates the code for micro gemm using fp32 vec instructions for compute.
+#     It supports input types of torch.float, torch.bfloat16, and torch.half with fp32 output.
+#     The output of the microkernel is in FP32, but it would be converted to BF16/FP16 in the template,
+#     if the desired output is BF16/FP16.
+#     """
+
+#     TEMPLATE_ENTRY = r"""
+# {{declare_kernel}} {
+#     using Vectorized = at::vec::Vectorized<{{compute_t}}>;
+#     constexpr auto VLEN = Vectorized::size();
+#     {{kernel.assert_function}}({{block_n}} % VLEN == 0, "block_n dimension must be multiple of Vector size");
+#     {{kernel.assert_function}}(K % {{block_k}} == 0, "K dimension must be multiple of {{block_k}}");
+#     // TODO(jgong5): loop unroll for M and N
+
+#     for (int64_t m = 0; m < M; m += {{block_m}}) {
+#         int64_t block_m = std::min<int64_t>(M - m, {{block_m}});
+#         for (int64_t n = 0; n < N; n += {{block_n}}) {
+#             int64_t block_n = std::min<int64_t>(N - n, {{block_n}});
+#             if (block_m == {{block_m}} && block_n == {{block_n}}) {
+#                 {{kernel_name}}_kernel<{{block_m}}, {{block_n}}, accum, prefetch>(
+#                     A + m * lda,
+#                     B + n * ldb,
+#                     C + m * ldc + n,
+#                     K,
+#                     lda,
+#                     ldb,
+#                     ldc
+#                 );
+#             } else {
+#                 switch (block_m) {
+# {%- for b in range(block_m - 1, 0, -1) %}
+#                 case {{b}}:
+#                     {{kernel_name}}_kernel<{{b}}, {{block_n}}, accum, prefetch>(
+#                         A + m * lda,
+#                         B + n * ldb,
+#                         C + m * ldc + n,
+#                         K,
+#                         lda,
+#                         ldb,
+#                         ldc
+#                     );
+#                     break;
+# {%- endfor %}
+#                 default:
+#                     {{kernel.assert_function}}(false, "Unsupported block_m: {{block_m}}");
+#                 }
+#             }
+#         }
+#     }
+# }
+# """
+
+#     TEMPLATE_KERNEL = r"""
+# template <int64_t BLOCK_M, int64_t BLOCK_N, bool accum, bool prefetch=false>
+# inline void {{kernel_name}}_kernel(
+#     const {{input_t}}* {{restrict_keyword}} A,
+#     const {{input2_t}}* {{restrict_keyword}} B,
+#     {{output_t}}* {{restrict_keyword}} C,
+#     int64_t K,
+#     int64_t lda,
+#     int64_t ldb,
+#     int64_t ldc
+# ) {
+#     using VectorizedIn = at::vec::Vectorized<{{input_t}}>;
+#     using Vectorized = at::vec::Vectorized<{{compute_t}}>;
+#     constexpr auto VLEN = VectorizedIn::size();
+
+#     int _K = (K + VLEN - 1) / VLEN;
+#     int ktail = _K * VLEN - K;
+#     // sub-block size of BLOCK_N and BLOCK_M
+#     constexpr int sM = 1;
+#     constexpr int sN = 4;
+#     constexpr int bN = (BLOCK_N + sN - 1) / sN;
+#     constexpr int bM = (BLOCK_M + sM - 1) / sM;
+
+#     VectorizedIn va;
+#     at::vec::VectorizedN<{{input_t}}, sN> vb;
+
+#     at::vec::VectorizedN<{{compute_t}}, sN * sM> vmid;
+
+#     auto compute = [&](int m, int n, int k) {
+#         int load_size = (k == _K - 1 && ktail != 0) ? (K - k * VLEN) : VLEN;
+#         {{kernel.unroll_pragma(8)}}
+#         for (int i = 0; i < sN; i++) {
+#             vb[i] = VectorizedIn::loadu(B + (sN * n + i) * ldb + k * VLEN, load_size);
+#         }
+
+#         {{kernel.unroll_pragma(1)}}
+#         for (int s = 0; s < sM; s++) {
+#             va = VectorizedIn::loadu(A + (sM * m + s) * lda + k * VLEN, load_size);
+# {%- if alpha != 1 %}
+#             va = va * VectorizedIn({{alpha}});
+# {%- endif %}
+#             if (k == 0) {
+#                 {{kernel.unroll_pragma(8)}}
+#                 for (int i = 0; i < sN; i++) {
+#                     vmid[sN * s + i] = _mm512_dpbf16_ps(Vectorized(0.0f), reinterpret_cast<__m512bh&>(va), reinterpret_cast<__m512bh&>(vb[i]));
+#                 }
+#             } else {
+#                 {{kernel.unroll_pragma(8)}}
+#                 for (int i = 0; i < sN; i++) {
+#                     vmid[sN * s + i] = _mm512_dpbf16_ps(vmid[sN * s + i], reinterpret_cast<__m512bh&>(va), reinterpret_cast<__m512bh&>(vb[i]));
+#                 }
+#             }
+#         }
+
+#         // store to C
+#         if (k == _K - 1) {
+#             {{kernel.unroll_pragma(1)}}
+#             for (int s = 0; s < sM; s++) {
+#                 {{kernel.unroll_pragma(8)}}
+#                 for (int i = 0; i < sN; i++) {
+#                     auto v = at::vec::vec_reduce_all([](Vectorized& x, Vectorized& y) { return x + y; }, vmid[sN * s + i]);
+#                     if constexpr (accum) {
+#                         auto c = *(C + (sM * m + s) * ldc + sN * n + i);
+#                         *(C + (sM * m + s) * ldc + sN * n + i) = c + v;
+#                     } else {
+#                         *(C + (sM * m + s) * ldc + sN * n + i) = v;
+#                     }
+#                 }
+#             }
+#         }
+#     };
+
+#     for (int m = 0; m < bM; ++m) {
+#         for (int n = 0; n < bN; ++n) {
+#             for (int k = 0; k < _K; ++k) {
+#                 compute(m, n, k);
+#             }
+#         }
+#     }
+# }
+# """
+
+
+#     def __init__(
+#         self,
+#         name,
+#         input_dtype,
+#         input2_dtype,
+#         output_dtype,
+#         compute_dtype,
+#         register_blocking,
+#         alpha=1,
+#     ) -> None:
+#         super().__init__(
+#             name,
+#             input_dtype,
+#             input2_dtype,
+#             output_dtype,
+#             compute_dtype,
+#             register_blocking,
+#             alpha,
+#         )
+
+#     def codegen_define(self, kernel: CppTemplateKernel) -> str:
+#         options = {
+#             "declare_kernel": self.get_kernel_declaration(),
+#             "kernel": kernel,
+#             "block_m": self.register_blocking.block_m,
+#             "block_n": self.register_blocking.block_n,
+#             "block_k": self.register_blocking.block_k,
+#             "restrict_keyword": get_restrict_keyword(),
+#             **self.get_common_options(),
+#         }
+#         result = KernelTemplate._template_from_string(self.TEMPLATE_KERNEL).render(
+#             options
+#         )
+#         result += KernelTemplate._template_from_string(self.TEMPLATE_ENTRY).render(
+#             options
+#         )
+#         return result
+
+
 @register_micro_gemm(
     *generate_gemm_config(
         VecAVX512,
@@ -347,7 +552,7 @@ def do_not_use_with_small_m_for_int8_woq(config, m, n, k, alpha, num_threads, **
     ),
     *generate_gemm_config(
         VecAVX512,
-        [(8, 48, 1), (8, 32, 1), (16, 16, 1)],
+        [(8, 32, 1),], # (8, 48, 1), (8, 32, 1), (16, 16, 1)
         input_dtype=torch.bfloat16,
         output_dtype=torch.float,
     ),
@@ -571,13 +776,13 @@ inline void {{kernel_name}}_transpose_b_kernel(
 {%- endif %}
 
 {%- if not trans_b %}
-    constexpr auto VLEN = Vectorized::size();
+    constexpr auto VLEN = Vectorized::size() * 2;
     constexpr auto ROWS = BLOCK_M;
     constexpr auto COLS = BLOCK_N / VLEN;
 
     Vectorized va;
-    at::vec::VectorizedN<{{compute_t}}, COLS> vb;
-    at::vec::VectorizedN<{{compute_t}}, ROWS*COLS> vc;
+    at::vec::VectorizedN<{{compute_t}}, COLS * 2> vb;
+    at::vec::VectorizedN<{{compute_t}}, ROWS*COLS * 2> vc;
 
     {%- if tail_n %}
     int64_t rCOLS = (N + VLEN - 1) / VLEN;
@@ -585,21 +790,21 @@ inline void {{kernel_name}}_transpose_b_kernel(
     {%- endif %}
     auto loadc = [&](auto i) {
         if constexpr (accum) {
-            constexpr int row = i / COLS;
-            constexpr int col = i % COLS;
+            constexpr int row = i / (2 * COLS);
+            constexpr int col = i % (2 * COLS);
     {%- if tail_n %}
             int load_size = (col == rCOLS - 1 && ntail != 0) ? ntail : VLEN;
             if (col < rCOLS) {
                 vc[i] = Vectorized::loadu(C + row * ldc + col * VLEN, load_size);
             }
     {%- else %}
-            vc[i] = Vectorized::loadu(C + row * ldc + col * VLEN);
+            vc[i] = Vectorized::loadu(C + row * ldc + col * (VLEN >> 1));
     {%- endif %}
         } else {
             vc[i] = Vectorized(0.0f);
         }
     };
-    c10::ForcedUnroll<ROWS * COLS>{}(loadc);
+    c10::ForcedUnroll<ROWS * 2 * COLS>{}(loadc);
 
     auto compute = [&, COLS](auto i, int k) {
         constexpr int row = i / COLS;
@@ -636,7 +841,10 @@ inline void {{kernel_name}}_transpose_b_kernel(
 
         {%- if input2_dtype in [torch.bfloat16, torch.float16] %}
             auto b = VectorizedIn::loadu(B + k * ldb + col * VLEN, VLEN);
-            vb[col] = at::vec::convert<{{compute_t}}>(b);
+            std::tie(vb[col], vb[col + 1]) = at::vec::convert_to_float<{{input_t}}>(b);
+            if constexpr (prefetch) {
+              _mm_prefetch(B + (k + {{block_k}}) * ldb + col * VLEN, _MM_HINT_T0);
+            }
         {%- elif input2_dtype == torch.int8 %}
             // Convert VLEN int8 elements to int32, and then fp32
             auto b32 = at::vec::convert_to_int32<int8_t>(B + k * ldb + col * VLEN);
@@ -651,13 +859,15 @@ inline void {{kernel_name}}_transpose_b_kernel(
 
         }
 
-        constexpr int idx = row * COLS + col;
+        constexpr int idx = row * 2 * COLS + col;
     {%- if tail_n %}
         if (col < rCOLS) {
-            vc[idx] = at::vec::fmadd(va, vb[col], vc[idx]);
+            vc[idx] = at::vec::fmadd(va, vb[2 * col], vc[idx]);
+            vc[idx + 1] = at::vec::fmadd(va, vb[2 * col + 1], vc[idx + 1]);
         }
     {%- else %}
-        vc[idx] = at::vec::fmadd(va, vb[col], vc[idx]);
+        vc[idx] = at::vec::fmadd(va, vb[2 * col], vc[idx]);
+        vc[idx + 1] = at::vec::fmadd(va, vb[2 * col + 1], vc[idx + 1]);
     {%- endif %}
     };
 
@@ -667,18 +877,18 @@ inline void {{kernel_name}}_transpose_b_kernel(
 
     // store to C
     auto storec = [&](auto i) {
-        constexpr int row = i / COLS;
-        constexpr int col = i % COLS;
+        constexpr int row = i / (COLS * 2);
+        constexpr int col = i % (COLS * 2);
     {%- if tail_n %}
         int store_size = (col == rCOLS - 1 && ntail != 0) ? ntail : VLEN;
         if (col < rCOLS) {
             vc[i].store(C + row * ldc + col * VLEN, store_size);
         }
     {%- else %}
-        vc[i].store(C + row * ldc + col * VLEN);
+        vc[i].store(C + row * ldc + col * (VLEN >> 1));
     {%- endif %}
     };
-    c10::ForcedUnroll<ROWS * COLS>{}(storec);
+    c10::ForcedUnroll<ROWS * 2 * COLS>{}(storec);
 
 {%- else %}
     // Use 2 implementations for the transposed B:
@@ -984,7 +1194,7 @@ def check_amx_extra(config, m, n, k, alpha, num_threads, **kwargs):
     ),
     *generate_gemm_config(
         VecAMX,
-        [(32, 32, 32), (48, 16, 32), (16, 48, 32)],
+        [(32, 16, 32), (32, 32, 32), (48, 16, 32), (16, 48, 32)],
         input_dtype=torch.bfloat16,
         output_dtype=torch.float,
         extra_check=check_amx_extra,
@@ -1132,16 +1342,34 @@ inline void {{kernel_name}}_amx_kernel_{{num_rows}}_{{num_columns}}(
     int64_t ldc,
     uint8_t tilecfg_rows
 ) {
-    // TODO(jgong5): add prefetch hint for A, B, C
+    //const int PREFETCH_SIZE_K = 32*1;
+    //const int PREFETCH_SIZE_K_large = 32*6;
     auto loadconfig = [](const amx_tilecfg& cfg) {
         _tile_loadconfig(&cfg);
     };
+
     const auto last_k_offset = K / {{block_k}} * {{block_k}};
     const auto tail_k_size = K - last_k_offset;
+
+//{{kernel.unroll_pragma(4)}}
+//for (int k = 0; k < last_k_offset; k += {{block_k}}) {
+//    {%- for tile_col in range(num_columns) %}
+//        //if (k + PREFETCH_SIZE_K_large < K) {
+//            _mm_prefetch(B + (k + PREFETCH_SIZE_K_large) * ldb + {{tile_col * 16 * vnni_size}}, _MM_HINT_T1);
+//        //}
+//    {%- endfor %}
+//
+//    {%- for tile_row in range(num_rows // 16) %}
+//        //if (k + PREFETCH_SIZE_K_large < K) {
+//        _mm_prefetch(A + {{tile_row * 16}} * lda + k + PREFETCH_SIZE_K_large, _MM_HINT_T1);
+//        //}
+//    {%- endfor %}
+//}
+
     if C10_LIKELY (last_k_offset > 0) {
         amx_state.configure(tilecfg_rows, 64, {{num_rows}} / 16, {{num_columns}}, loadconfig);
     } else {
-        amx_state.configure(tilecfg_rows, tail_k_size * sizeof({{input_t}}), {{num_rows}} / 16, {{num_columns}}, loadconfig);
+        amx_state.configure(tilecfg_rows, tail_k_size * sizeof({{input_t}}), {{num_rows}} >> 4, {{num_columns}}, loadconfig);
     }
     auto load_c = [&]() {
 {%- for tile_row in range(num_rows // 16) %}
@@ -1177,8 +1405,14 @@ inline void {{kernel_name}}_amx_kernel_{{num_rows}}_{{num_columns}}(
         {%- if tile_col == 0 %}
         if constexpr (horizontal_transverse) {
             _tile_loadd({{tile_idx_a}}, A + {{tile_row * 16}} * lda + k, lda * sizeof({{input_t}}));
+            //if (k + PREFETCH_SIZE_K < K) {
+            //    _mm_prefetch(A + {{tile_row * 16}} * lda + k + PREFETCH_SIZE_K, _MM_HINT_T0);
+            //}
         } else {
             _tile_stream_loadd({{tile_idx_a}}, A + {{tile_row * 16}} * lda + k, lda * sizeof({{input_t}}));
+            //if (k + PREFETCH_SIZE_K < K) {
+            //    _mm_prefetch(A + {{tile_row * 16}} * lda + k + PREFETCH_SIZE_K, _MM_HINT_T1);
+            //}
         }
         {%- endif %}
         {%- if tile_row == 0 %}
@@ -1188,8 +1422,14 @@ inline void {{kernel_name}}_amx_kernel_{{num_rows}}_{{num_columns}}(
                 B + k * ldb + {{tile_col * 16 * vnni_size}},
                 ldb * {{vnni_size}} * sizeof({{input_t}})
             );
+            //if (k + PREFETCH_SIZE_K_large < K) {
+            //    _mm_prefetch(B + (k + PREFETCH_SIZE_K_large) * ldb + {{tile_col * 16 * vnni_size}}, _MM_HINT_T0);
+            //}
         } else {
             _tile_loadd({{tile_idx_b}}, B + k * ldb + {{tile_col * 16 * vnni_size}}, ldb * {{vnni_size}} * sizeof({{input_t}}));
+            //if (k + PREFETCH_SIZE_K < K) {
+            //    _mm_prefetch(B + (k + PREFETCH_SIZE_K) * ldb + {{tile_col * 16 * vnni_size}}, _MM_HINT_T0);
+            //}
         }
         {%- endif %}
         {%- if int8_gemm %}
@@ -1921,6 +2161,7 @@ def create_micro_gemm(
     """
 
     def create_from_config(cls, config: CppMicroGemmConfig):
+        print("config: ", config)
         return cls(
             name,
             config.input_dtype,
@@ -1989,6 +2230,18 @@ def create_micro_gemm(
                 # 3. Number of mxn blocks is large enough to occupy all the threads
                 # 4. Register blocks are larger
                 isa_score = 0
+                # if config.vec_isa_cls == VecAVX512 and is_small_m_dim_corner_case(config,
+                #     m,
+                #     n,
+                #     k,
+                #     alpha,
+                #     num_threads,
+                #     dynamic_M=dynamic_M,
+                #     q_group_size=q_group_size):
+                #     # corner case: for small m dim, AVX512 micro-kernel may outperform AMX micro-kernel
+                #     isa_score += 1
+                # elif config.vec_isa_cls == VecAMX:
+                #     isa_score += 1
                 if config.vec_isa_cls == VecAMX:
                     isa_score += 1
                 dividable_score = 0
@@ -2010,6 +2263,10 @@ def create_micro_gemm(
                     + (block_m * block_k + block_k * block_n)
                     * config.input_dtype.itemsize
                 )
+                # if number of mxn blocks can not occupy all the threads,
+                # we favor smaller register blocks.
+                if occupancy_score == 0:
+                    occupancy_score = total_mxn_blocks / num_threads
                 matched_configs.append(
                     (
                         (isa_score, dividable_score, occupancy_score, register_bytes),

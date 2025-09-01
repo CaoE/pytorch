@@ -344,6 +344,8 @@ class CppGroupedGemmTemplate(CppGemmTemplate):
         template.maybe_append_choice(choices)
         return template
 
+    def get_kernel_prefix_name(self):
+        return "g{}_".format(self.gemm_grouped_num) + "m{}".format(self.m) + "_n{}".format(self.n) + "_k{}".format(self.k)
     def render(  # type: ignore[override,return,no-untyped-def]
         self,
         kernel: CppTemplateKernel,

@@ -152,6 +152,10 @@ class CppTemplateKernel(CppKernel):
         Slice the given node with a list of ranges (start and end) corresponding to its dims.
         The dim is not sliced if the corresponding range is empty.
         """
+        # print("------------------------------------------------")
+        # print("ranges: ", ranges)
+        # print("node.get_size(): ", node.get_size())
+        # print("node.get_stride(): ", node.get_stride())
         assert len(ranges) == len(node.get_size()), f"{ranges=}, {node=}"
         sliced = wrap_with_tensorbox(node)
         for dim, _range in enumerate(ranges):
@@ -183,18 +187,25 @@ class CppTemplateKernel(CppKernel):
         assert isinstance(permuted, ir.ReinterpretView)
         return permuted
 
-    def maybe_codegen_profile(self) -> str:
+    def maybe_codegen_profile(self, prefix_kernel_name: str = None) -> str:
         if config.cpp.enable_kernel_profile:
             graph_id = V.graph.graph_id
-            # print("self.kernel_name: ", self.kernel_name)
-            if hasattr(self, "m") and hasattr(self, "n") and hasattr(self, "k"):
-            #     import pdb
-            #     pdb.set_trace()
-                new_prefix = "graph_" + str(graph_id) + "_" + "m{}".format(self.m) + "_n{}".format(self.n) + "_k{}_".format(self.k) if graph_id is not None else ""
-                if hasattr(self, "gemm_grouped_num"):
-                    new_prefix += "g{}_".format(self.gemm_grouped_num)
-                self.new_record_name = f"{new_prefix}{self.kernel_name}"
-            prefix = "graph_" + str(graph_id) + "_" if graph_id is not None else ""
+            # print("prefix_kernel_name: ", prefix_kernel_name)
+            # print("has get_kernel_prefix_name", hasattr(self, "get_kernel_prefix_name"))
+            # if hasattr(self, "m") and hasattr(self, "n") and hasattr(self, "k"):
+            # #     import pdb
+            # #     pdb.set_trace()
+            #     new_prefix = "graph_" + str(graph_id) + "_" + "m{}".format(self.m) + "_n{}".format(self.n) + "_k{}_".format(self.k) if graph_id is not None else ""
+            #     if hasattr(self, "gemm_grouped_num"):
+            #         new_prefix += "g{}_".format(self.gemm_grouped_num)
+            #     self.new_record_name = f"{new_prefix}{self.kernel_name}"
+            
+            
+            if prefix_kernel_name:
+                prefix = "graph_" + str(graph_id) + "_" + prefix_kernel_name + "_" if graph_id is not None else ""
+                # self.new_record_name = f"{prefix}{self.kernel_name}"
+            else:
+                prefix = "graph_" + str(graph_id) + "_" if graph_id is not None else ""
             return f'RECORD_FUNCTION("{prefix}{self.kernel_name}", c10::ArrayRef<c10::IValue>({{}}));'
         else:
             return ""
@@ -215,6 +226,9 @@ class CppTemplateKernel(CppKernel):
         ctype = f"{DTYPE_TO_CPP[dtype]}"
         numel = f"{cexpr_index(buf.get_numel())}"
         return f"auto _{name} = std::make_unique<{ctype}[]>({numel}); auto {name} = _{name}.get();"
+        # itemsize = 4
+        # alloc_ = f"auto& {name}_allocator = *at::getCPUAllocator(); auto {name}_data = {name}_allocator.allocate({numel}*4); auto {name} = (float*)({name}_data.get());"
+        # return alloc_
 
     def define_stack_allocated_buffer(
         self, name, sizes: list[Any], dtype=torch.float
@@ -236,11 +250,13 @@ class CppTemplateKernel(CppKernel):
         ctype = f"{DTYPE_TO_CPP[buf.layout.dtype]}"
         numel = f"{cexpr_index(buf.get_numel())}"
         return f"if (_{name} == nullptr) {{ _{name} = std::make_unique<{ctype}[]>({numel}); {name} = _{name}.get(); }}"
+        # return f"if ({name} == nullptr) {{ auto& {name}_allocator = *at::getCPUAllocator(); auto {name}_data = {name}_allocator.allocate({numel}*4); auto {name} = (float*)({name}_data.get()); }}"
 
     def release_buffer(self, name):
         """Codegen the code to release the ownership of a local buffer to others"""
         assert name in self.local_buffers
         return f"_{name}.release()"
+        # return f"{name}_data.release()"
 
     def store_pointwise_nodes(
         self,

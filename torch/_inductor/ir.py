@@ -2985,6 +2985,16 @@ class View(GenericView):
             )
             return ReinterpretView(data=storage, layout=new_layout)
 
+        elif x.get_size()[0] == 1 and x.get_size()[1:] == new_size:
+            storage, old_layout = as_storage_and_layout(x, want_contiguous=False)
+            new_layout = FixedLayout(
+                old_layout.device,
+                old_layout.dtype,
+                new_size,
+                old_layout.stride[1:],
+                old_layout.offset,
+            )
+            return ReinterpretView(data=storage, layout=new_layout)
         reindex = cls.dynamic_reshape_indexer(old_size, new_size)
         return cls(data=x, size=list(new_size), reindex=reindex)
 
