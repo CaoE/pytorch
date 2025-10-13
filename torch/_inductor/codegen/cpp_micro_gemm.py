@@ -1,9 +1,12 @@
 # mypy: allow-untyped-defs
+import contextlib
 import dataclasses
 import operator
 import sys
 from enum import Enum
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
+
+import sympy
 
 import torch
 
@@ -17,11 +20,17 @@ from ..cpu_vec_isa import (
     VecNEON,
     VecSVE256,
 )
-from ..utils import IndentedBuffer, parallel_num_threads
+from ..utils import IndentedBuffer, parallel_num_threads, sympy_index_symbol_with_prefix
 from ..virtualized import V
 from .common import KernelTemplate
 from .cpp_template_kernel import CppTemplateKernel
 from .cpp_utils import DTYPE_TO_CPP, GemmBlocking, value_to_cpp
+from ..loop_body import LoopBody
+from .cpp import CppKernel, CppKernelProxy, KernelGroup, ParallelDepth
+from unittest.mock import patch
+from torch.utils._ordered_set import OrderedSet
+from torch.utils._sympy.symbol import symbol_is_type, SymT
+from .common import CSEVariable, Kernel, KernelArgs, OptimizationContext
 
 
 class LayoutType(Enum):
@@ -39,6 +48,276 @@ def get_restrict_keyword() -> str:
         return "__restrict"
     else:
         return "__restrict__"
+
+
+def rewrite_index_for_epilogue(
+    localize_buffer_handler: "EpilogueBufferHandler",
+    index: sympy.Expr,
+    global_buf_name: str,
+):
+    # Local buffer at the inner dimensions
+    snode = V.graph.scheduler.name_to_buf[global_buf_name].defining_op
+    assert snode is not None
+    local_buf = localize_buffer_handler.global_to_local[global_buf_name]
+    scheduler_nodes = snode.get_nodes()
+    _, (group, reduction_group) = max(
+        scheduler_nodes, key=lambda x: int(x.is_reduction())
+    ).group
+    call_ranges = tuple(group) + tuple(reduction_group)
+    indices_to_keep = [
+        f"x{len(call_ranges) - (idx + 1)}"
+        for idx in range(len(local_buf.get_layout().size))
+    ]
+    sorted_symbols = sorted(index.free_symbols, key=lambda s: s.name)  # type: ignore[attr-defined]
+    replacements = {}
+    for x in sorted_symbols:
+        if x.name.startswith("x") and x.name not in indices_to_keep:  # type: ignore[attr-defined]
+            # Only keep index used by local buffer
+            replacements[x] = sympy.core.numbers.Zero()
+    index = sympy_subs(index, replacements)  # type: ignore[arg-type]
+    return index
+
+def rewrite_index_for_epilogue_nodes(
+    localize_buffer_handler: "EpilogueBufferHandler",
+    index: sympy.Expr,
+    global_buf
+):
+    used_vars = OrderedSet(
+        s for s in index.free_symbols if symbol_is_type(s, SymT.INDEX)
+    )
+    assert len(used_vars) == 2 or len(used_vars) == 1
+    index_epilogue_m, index_epilogue_n = sympy.symbols("epilogue_m epilogue_n", integer=True, positive=True)
+    if len(used_vars) == 2:
+        index_vars = [index_epilogue_m, index_epilogue_n]
+    else:
+        index_vars = [index_epilogue_n]
+    # local_buf = localize_buffer_handler.global_to_local[global_buf_name]
+    # for i in range(len(local_buf.get_size())):
+    #     var = sympy_index_symbol_with_prefix(SymT.INDEX, i)
+    #     index_vars.append(var if var in used_vars else 0)
+    # if global_buf_name not in self.fake_buffers:
+    #     buf = V.graph.get_buffer(global_buf_name)
+    # else:
+    #     buf = self.fake_buffers[global_buf_name]
+    index = global_buf.get_layout().make_indexer()(index_vars)
+    return index
+
+class EpilogueBufferHandler(V.WrapperHandler):  # type: ignore[name-defined]
+    def __init__(
+        self,
+        inner,
+        global_to_local: dict[str, ir.Buffer],
+        rewrite_index: Callable[["EpilogueBufferHandler", sympy.Expr, str], sympy.Expr],
+        fake_buffers,
+        local_acc,
+    ) -> None:
+        super().__init__(inner)
+        self.global_to_local = global_to_local
+        self.rewrite_index = rewrite_index
+        self.fake_buffers = fake_buffers
+        self.fake_buffers_name = []
+        for buf in self.fake_buffers:
+            self.fake_buffers_name.append(buf.get_name())
+        self.local_acc = local_acc
+
+    def localize(self, name: str, index: sympy.Expr):
+        # TODO recompute index according to microgemm layout
+        # if self.global_to_local and name in self.global_to_local:
+        assert self.rewrite_index is not None
+        buf = None
+        if name not in self.fake_buffers_name:
+            buf = V.graph.get_buffer(name)
+        else:
+            for fake_buf in self.fake_buffers:
+                if fake_buf.get_name() == name:
+                    buf = fake_buf
+                    break
+        assert buf is not None
+        index = self.rewrite_index(self, index, buf)
+        # name = self.global_to_local[name].get_name()
+        return name, index
+
+    def load(self, name: str, index: sympy.Expr):
+        return self._inner.load(name, index)
+
+    def store(self, name, index, value, mode=None):
+        local_buffer_name, local_buffer_index = self.localize(name, index)
+        res = self._inner.store(local_buffer_name, local_buffer_index, value, mode)
+        if (
+            self.global_to_local
+            and name in self.global_to_local
+            and isinstance(V.kernel, Kernel)
+        ):
+            # Remove name of local buffer from Kernel.store_buffer_names
+            # local_buffer_name is added to Kernel.store_buffer_names in Kernel.CSEProxy.store.
+            V.kernel.store_buffer_names.discard(local_buffer_name)
+        return res
+
+    def store_reduction(self, name, index, value):
+        return self._inner.store_reduction(*self.localize(name, index), value)
+    
+
+class EpilogueBufferContext:
+    """
+    This class creates a context that helps to generate code involving Inductor IR with
+    function local buffers. These buffers are constructed during the codegen process and
+    are used to store intermediate results such as local accumulators. We do not want to
+    add them to `V.graph` since they are not global and we do not want to add them as
+    function arguments either. So we patch the codegen processes under this scope to support
+    these buffers without exposure to the outside world.
+    """
+
+    def __init__(self, kernel_args: KernelArgs, fake_buffers) -> None:
+        self.kernel_args = kernel_args
+        self.exit_stack = contextlib.ExitStack()
+        # map local buffer name to local buffer
+        self.local_buffers: dict[str, ir.Buffer] = {}
+        # map global buffer name to global buffer
+        self.global_buffers: dict[str, ir.Buffer] = {}
+        # map global buffer name to local buffer
+        self.global_to_local: dict[str, ir.Buffer] = {}
+        # record the global buffers that are removed by this LocalBufferContext
+        self.removed_buffers: OrderedSet[str] = OrderedSet()
+        self.epilogue_inputs: list[str] = []
+        self.epilogue_outputs: list[str] = []
+        self.fake_buffers = fake_buffers
+
+    def __enter__(self):
+        self.exit_stack.__enter__()
+        original_get_dtype = V.graph.get_dtype
+
+        def get_dtype(name):
+            # if name in self.local_buffers:
+            #     return self.local_buffers[name].get_dtype()
+            # if name in self.local_acc.get_name():
+            #     return self.local_acc.get_dtype()
+            return original_get_dtype(name)
+
+        self.exit_stack.enter_context(patch.object(V.graph, "get_dtype", get_dtype))
+
+        original_input = self.kernel_args.input
+
+        def input(name):
+            # if name in self.local_buffers:
+            #     return name
+            if name in self.local_acc:
+                return "C"
+            epilogue_input_name = original_input(name)
+            self.epilogue_inputs.append(epilogue_input_name)
+            return epilogue_input_name
+
+        self.exit_stack.enter_context(patch.object(self.kernel_args, "input", input))
+
+        original_output = self.kernel_args.output
+
+        def output(name):
+            # if name == self.local_acc.get_name():
+            #     return name
+            epilogue_output_name = original_output(name)
+            self.epilogue_outputs.append(epilogue_output_name)
+            return epilogue_output_name
+
+        self.exit_stack.enter_context(patch.object(self.kernel_args, "output", output))
+
+        # Set current LocalBufferContext into V
+        self.exit_stack.enter_context(V.set_local_buffer_context(self))
+
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.local_buffers.clear()
+        self.exit_stack.__exit__(exc_type, exc_val, exc_tb)
+
+    def add_local_buffer(
+        self, local_buffer: ir.Buffer, global_buffers: Optional[list[ir.Buffer]] = None
+    ):
+        assert local_buffer.get_name() not in self.local_buffers
+        self.local_buffers[local_buffer.get_name()] = local_buffer
+        if global_buffers:
+            for global_buffer in global_buffers:
+                global_buffer_name = global_buffer.get_name()
+                assert (
+                    global_buffer_name not in self.global_buffers
+                    and global_buffer_name not in self.global_to_local
+                )
+                self.global_buffers[global_buffer_name] = global_buffer
+                self.global_to_local[global_buffer_name] = local_buffer
+                if global_buffer_name not in V.graph.removed_buffers:
+                    # Record the global buffers that are removed by this LocalBufferContext
+                    # since which may need to restore. Refer to issue:
+                    # https://github.com/pytorch/pytorch/issues/144186
+                    self.removed_buffers.add(global_buffer_name)
+                    V.graph.removed_buffers.add(global_buffer_name)
+
+    def localize_function(
+        self,
+        fn: Callable[..., Any],
+        rewrite_index: Callable[
+            ["EpilogueBufferHandler", sympy.Expr, str], sympy.Expr
+        ] = None,
+    ):
+        def inner(*args, **kwargs):
+            with V.set_ops_handler(
+                EpilogueBufferHandler(
+                    V.get_ops_handler(),
+                    global_to_local=self.global_to_local,
+                    rewrite_index=rewrite_index,
+                    fake_buffers=self.fake_buffers,
+                    local_acc=self.local_acc
+                )
+            ):
+                return fn(*args, **kwargs)
+
+        return inner
+
+    def localize_nodes(
+        self,
+        nodes: list[ir.IRNode],
+        rewrite_index: Callable[
+            ["EpilogueBufferHandler", sympy.Expr, str], sympy.Expr
+        ] = rewrite_index_for_epilogue_nodes,
+    ) -> list[ir.IRNode]:
+        """
+        Given `local_buf` and `global_buf` registered in current `LocalBufferContext`
+        though the method of `add_local_buffer`, localizes the `global_buf` to `local_buf`
+        for the given `nodes` and returns a new list of IR nodes that work on `local_buf`
+        instead of `global_buf`, i.e., all the loads and stores are redirected to
+        `local_buf`. This helps the fused loops to work on smaller-sized local buffers
+        for better data locality.
+
+        The data access of `local_buf` is assumed to be contiguous with the
+        same order as the `global_buf`.
+        """
+        assert len(nodes) > 0
+
+        def wrap_inner_fn_for_node(node: ir.IRNode):
+            loops = node.data if isinstance(node, ir.ComputedBuffer) else node
+            assert isinstance(loops, ir.Loops)
+            new_inner_fn = self.localize_function(
+                loops.inner_fn,
+                rewrite_index,
+            )
+
+            new_loops = dataclasses.replace(loops, inner_fn=new_inner_fn)
+            if isinstance(node, ir.ComputedBuffer):
+                # TODO rename buffer： epilogue1， epilogue2，...
+                # To generate cpp code like: 
+                # auto tmp0 = at::vec::Vectorized<xxx>::loadu(epilogue1 + epilogue_index1)
+                # auto tmp1 = at::vec::Vectorized<xxx>::loadu(epilogue2 + epilogue_index2)
+                # ...
+                # computing
+                # xxx.store(output_ptr(Y) + output_index)
+            
+                # TODO create new layout by microgemm layout
+                new_node = ir.ComputedBuffer(
+                    name=f"{node.get_name()}", layout=node.get_layout(), data=new_loops
+                )
+            else:
+                new_node = new_loops  # type: ignore[assignment]
+
+            return new_node
+
+        return [wrap_inner_fn_for_node(node) for node in nodes]
 
 
 class CppMicroGemm:
@@ -159,7 +438,9 @@ inline void {{kernel_name}}(
         )
         with res.indent():
             kwargs_for_extra_args.update({"kernel": kernel})
+            # TODO get epilogue nodes from kwargs_for_extra_args
             extra_args = self.get_kernel_extra_args(**kwargs_for_extra_args)
+            # TODO assert C is epilogue input, i.e., local_acc_buf
             for arg in extra_args:
                 res.writeline(arg)
             res.writeline(f"{A_ptr},")
@@ -171,6 +452,7 @@ inline void {{kernel_name}}(
             res.writeline(f"{lda},")
             res.writeline(f"{ldb},")
             res.writeline(f"{ldc}")
+            # TODO set epilogue args from kwargs_for_extra_args
         res.writeline(");")
         return res.getvalue()
 
@@ -1031,8 +1313,29 @@ class CppMicroGemmAMX(CppMicroGemm):
     It supports input types of torch.bfloat16 with fp32 output.
     """
 
+    DECLARE_EPILOGUE_KERNEL = r"""
+template <bool accum, bool prefetch=false>
+inline void {{kernel_name}}(
+{%- if kernel_extra_args_declare %}
+    {{kernel_extra_args_declare}}
+{%- endif %}
+    const {{input_t}}* {{restrict_keyword}} A,
+    const {{input2_t}}* {{restrict_keyword}} B,
+    {{output_t}}* {{restrict_keyword}} C,
+    {{output_t}}* {{restrict_keyword}} Y,
+    EPILOGUE_DEFINE_PLACEHOLDER,
+    int64_t M,
+    int64_t N,
+    int64_t K,
+    int64_t lda,
+    int64_t ldb,
+    int64_t ldc
+)
+"""
+
+
     TEMPLATE_ENTRY = r"""
-{{declare_kernel}} {
+{{DECLARE_EPILOGUE_KERNEL}} {
     {{kernel.assert_function}}(N % {{block_n}} == 0, "N dimension must be multiple of {{block_n}}");
     {{kernel.assert_function}}(K % 2 == 0, "K dimension must be multiple of 2");
 {%- if pack_vnni_B_locally %}
@@ -1127,6 +1430,7 @@ class CppMicroGemmAMX(CppMicroGemm):
                     B + n,
 {%- endif %}
                     C + m * ldc + n,
+                    EPILOGUE_OFFSET_PLACEHOLDER,
                     K,
                     lda,
                     updated_ldb,
@@ -1173,6 +1477,8 @@ inline void {{kernel_name}}_amx_kernel_{{num_rows}}_{{num_columns}}(
     const {{input2_t}}* {{restrict_keyword}} B,
 {%- endif %}
     {{output_t}}* {{restrict_keyword}} C,
+    {{output_t}}* {{restrict_keyword}} Y,
+    EPILOGUE_DEFINE_PLACEHOLDER,
     int64_t K,
     int64_t lda,
     int64_t ldb,
@@ -1249,6 +1555,7 @@ inline void {{kernel_name}}_amx_kernel_{{num_rows}}_{{num_columns}}(
         compute(k);
     }
 
+
     auto store_c = [&]() {
     // store to C
 {%- for tile_row in range(num_rows // 16) %}
@@ -1257,6 +1564,7 @@ inline void {{kernel_name}}_amx_kernel_{{num_rows}}_{{num_columns}}(
         _tile_stored({{tile_idx}}, C + {{tile_row * 16}} * ldc + {{tile_col * 16}}, ldc * sizeof({{output_t}}));
     {%- endfor %}
 {%- endfor %}
+{{store_epilogues(kernel, num_rows, num_columns, epilogue_nodes)}}
     };
 
     // TODO(jgong5): move tail k computation to separate loopnest to save tile configuration overhead
@@ -1273,7 +1581,7 @@ inline void {{kernel_name}}_amx_kernel_{{num_rows}}_{{num_columns}}(
 }
 """
 
-    def codegen_define(self, kernel: CppTemplateKernel) -> str:
+    def codegen_define(self, kernel: CppTemplateKernel, fake_buffers=None, epilogue_nodes=None) -> str:
         block_m, block_n, block_k = self.register_blocking
         assert block_m % 16 == 0, "Only support block_m % 16 == 0 for AMX"
         assert block_n % 16 == 0, "Only support block_n % 16 == 0 for AMX"
@@ -1294,8 +1602,15 @@ inline void {{kernel_name}}_amx_kernel_{{num_rows}}_{{num_columns}}(
             "block_k": block_k,
             "num_columns": num_columns,
             "restrict_keyword": get_restrict_keyword(),
+            "epilogue_nodes": epilogue_nodes,
+            "store_epilogues": self.store_epilogues,
+            "fake_buffers": fake_buffers,
             **self.get_common_options(),
         }
+        self.fake_buffers = fake_buffers
+        self.fake_buffers_name = []
+        for buf in self.fake_buffers:
+            self.fake_buffers_name.append(buf.get_name())
         result = ""
         for num_rows in range(block_m, 0, -16):
             amx_kernel_options = {**options, "num_rows": num_rows}
@@ -1305,6 +1620,51 @@ inline void {{kernel_name}}_amx_kernel_{{num_rows}}_{{num_columns}}(
         result += KernelTemplate._template_from_string(self.TEMPLATE_ENTRY).render(
             options
         )
+
+        def declare_kernel_hook():
+            res = IndentedBuffer()
+            # for input_name in self.scope.epilogue_inputs:
+
+            #     # arg = kernel.args.input(node.get_name())
+            #     arg = V.graph.get_buffer(input_name)
+            #     with res.indent():
+            #         res.writeline(f"{DTYPE_TO_CPP[arg.get_type()]}* {arg},")
+
+            for node in epilogue_nodes:
+                reads = node.get_reads()
+                for rd in reads:
+                    if 'GemmOut' not in rd.name:
+                        arg_name = kernel.args.input(rd.name)
+                        arg = V.graph.get_buffer(rd.name)
+                        with res.indent():
+                            res.writeline(f"{DTYPE_TO_CPP[arg.get_dtype()]}* {arg_name},")
+            return res.getvalue()
+
+        def epilogue_offset_placeholder():
+            res = IndentedBuffer()
+            # for node in options["epilogue_nodes"]:
+            # for input_name in self.scope.epilogue_inputs:
+            #     # arg = kernel.args.input(input_name)
+            #     arg = V.graph.get_buffer(input_name)
+            #     with res.indent():
+            #         res.writeline(f"{input_name} + {arg.get_stride()[0]} * m + {arg.get_stride()[1]} * n,")
+
+            for node in epilogue_nodes:
+                reads = node.get_reads()
+                for rd in reads:
+                    if 'GemmOut' not in rd.name:
+                        arg_name = kernel.args.input(rd.name)
+                        arg = V.graph.get_buffer(rd.name)
+                        with res.indent():
+                            if len(arg.get_stride()) == 1:
+                                res.writeline(f"{arg_name} + {arg.get_stride()[0]} * n,")
+                            else:
+                                assert len(arg.get_stride()) == 2
+                                res.writeline(f"{arg_name} + {arg.get_stride()[0]} * m + {arg.get_stride()[1]} * n,")
+            return res.getvalue()
+
+        kernel.render_hooks["EPILOGUE_DEFINE_PLACEHOLDER"] = declare_kernel_hook
+        kernel.render_hooks["EPILOGUE_OFFSET_PLACEHOLDER"] = epilogue_offset_placeholder
         return result
 
     def codegen_init(
@@ -1331,6 +1691,295 @@ inline void {{kernel_name}}_amx_kernel_{{num_rows}}_{{num_columns}}(
         else:
             return LayoutType.VNNI2
 
+    def codegen_call_with_epilogue(
+        self,
+        kernel: CppTemplateKernel,
+        A: ir.Buffer,
+        B: ir.Buffer,
+        C: ir.Buffer,
+        epilogue_nodes,
+        accum: bool,
+        prefetch: bool = False,
+        **kwargs_for_extra_args,
+    ) -> str:
+        """
+        Generate the code for calling the templated kernel that computes
+        `C += alpha * A @ B` if `accum` is True, or `C = alpha * A @ B` otherwise.
+        """
+        self.C = C
+        A_ptr = f"&({kernel.index(A, [0, 0])})"
+        B_ptr = f"&({kernel.index(B, [0, 0])})"
+        C_ptr = f"&({kernel.index(C, [0, 0])})"
+        # Y_ptr = f"&({kernel.index(Y, [0, 0])})"
+        M = kernel.size(C, 0)
+        N = kernel.size(C, 1)
+        K = kernel.size(A, 1)
+        lda = kernel.stride(A, 0)
+        ldb = kernel.stride(B, 0)
+        ldc = kernel.stride(C, 0)
+        res = IndentedBuffer()
+        res.writeline(
+            f"{self.name}<{value_to_cpp(accum, 'bool')}, {value_to_cpp(prefetch, 'bool')}>("
+        )
+        with res.indent():
+            kwargs_for_extra_args.update({"kernel": kernel})
+            extra_args = self.get_kernel_extra_args(**kwargs_for_extra_args)
+            for arg in extra_args:
+                res.writeline(arg)
+            res.writeline(f"{A_ptr},")
+            res.writeline(f"{B_ptr},")
+            res.writeline(f"{C_ptr},")
+            res.writeline(f"Y,")
+            res.writeline("EPILOGUE_CALL_PLACEHOLDER" if epilogue_nodes else "")
+            res.writeline(f"{M},")
+            res.writeline(f"{N},")
+            res.writeline(f"{K},")
+            res.writeline(f"{lda},")
+            res.writeline(f"{ldb},")
+            res.writeline(f"{ldc}")
+        res.writeline(");")
+
+        def hook():
+            res = IndentedBuffer()
+            for node in epilogue_nodes:
+                reads = node.get_reads()
+                for rd in reads:
+                    if 'GemmOut' not in rd.name:
+                        arg = kernel.args.input(rd.name)
+                        with res.indent():
+                            res.writeline(f"{arg},")
+            return res.getvalue()
+
+        kernel.render_hooks["EPILOGUE_CALL_PLACEHOLDER"] = hook
+        return res.getvalue()
+
+    def epilogue_post_process(self, epilogue_code):
+        # TODO 
+        # get load computing and store
+        # replace x0,x1
+        # replace ldc
+        return """
+    #pragma GCC ivdep
+    for(int64_t x0=static_cast<int64_t>(0L); x0<static_cast<int64_t>(32L); x0+=static_cast<int64_t>(1L))
+    {
+        for(int64_t x1=static_cast<int64_t>(0L); x1<static_cast<int64_t>(32L); x1+=static_cast<int64_t>(32L))
+        {
+            {
+                if(C10_LIKELY(x1 >= static_cast<int64_t>(0) && x1 < static_cast<int64_t>(32L)))
+                {
+                    auto tmp0 = at::vec::Vectorized<at::BFloat16>::loadu(inp + static_cast<int64_t>(x1), static_cast<int64_t>(32));
+                    auto tmp2 = at::vec::Vectorized<at::BFloat16>::loadu(C + static_cast<int64_t>(x1 + ldc*x0), static_cast<int64_t>(32));
+                    auto tmp6 = at::vec::Vectorized<at::BFloat16>::loadu(in_ptr3 + static_cast<int64_t>(x1 + 1024L*x0), static_cast<int64_t>(32));
+                    auto tmp1 = at::vec::convert<float,2,at::BFloat16,1>(tmp0);
+                    auto tmp3 = at::vec::convert<float,2,at::BFloat16,1>(tmp2);
+                    auto tmp4 = tmp1 + tmp3;
+                    auto tmp5 = at::vec::convert<at::BFloat16,1,float,2>(tmp4);
+                    auto tmp7 = at::vec::convert<float,2,at::BFloat16,1>(tmp6);
+                    auto tmp8 = tmp4 + tmp7;
+                    auto tmp9 = at::vec::convert<at::BFloat16,1,float,2>(tmp8);
+                    tmp5.store(Y + static_cast<int64_t>(x1 + 1024L*x0), static_cast<int64_t>(32));
+                    tmp9.store(Y + static_cast<int64_t>(x1 + 1024L*x0), static_cast<int64_t>(32));
+                }
+            }
+        }
+    }"""
+
+    def store_epilogue_nodes(
+        self,
+        kernel,
+        # dst: ir.Buffer,
+        nodes: list[ir.IRNode],
+        num_rows,
+        num_cols,
+    ) -> str:
+        # # get inputs of epilogue nodes
+        var_sizes = ((num_rows, num_cols * 16), ())
+        var_ranges = {
+            sympy_index_symbol_with_prefix(SymT.INDEX, i): sz
+            for i, sz in enumerate(var_sizes[0])
+        }
+        # index_epilogue_m, index_epilogue_n = sympy.symbols("epilogue_m epilogue_n", integer=True, positive=True)
+        # if len(var_ranges) == 2:
+        #     index_vars = [index_epilogue_m, index_epilogue_n]
+        # else:
+        #     index_vars = [index_epilogue_n]
+        # if not offsets:
+        #     offsets = [sympy.S.Zero] * len(var_sizes[0])
+        # offsets = [tile_row, tile_col]
+        # if not reindexers:
+        #     reindexers = [None] * len(nodes)
+        # assert len(offsets) == len(var_sizes[0])
+        # dst_name = nodes[-1].get_name()
+        # output_index = nodes[-1].get_layout().make_indexer()(index_vars)
+        output_index = nodes[-1].get_layout().make_indexer()([*var_ranges.keys()])
+        # ld = "ldc"
+        # output_index_str = self.write_epilogue_index(tile_row, tile_col, ld)
+        # output_index = sympy.simplify(output_index_str)
+        kernel_group = KernelGroup()
+        # update kernel args
+
+        # updated_args = {
+        #     "epilogue0": 
+        # }
+        kernel_group.args = kernel.args
+        cpp_kernel_proxy = CppKernelProxy(kernel_group)
+        bodies = []
+        var_sizes_list = []
+        for i, node in enumerate(nodes):
+            output_name = node.get_name()
+            node = node.data if isinstance(node, ir.ComputedBuffer) else node
+            # ld = node.get_stride()[1]
+            # ld = "ldc"
+            assert isinstance(node, ir.Pointwise), node
+
+            def fn(*args):
+                assert len(args) == 2
+                assert len(args[0]) == len(var_sizes[0])
+                assert len(args[1]) == 0
+                # if reindexers[i] is not None:
+                #     new_args = reindexers[i](new_args)  # type: ignore[misc]
+                # new_args = sympy.simplify(self.write_epilogue_index(tile_row, tile_col, ld))
+                V.ops.store(
+                    output_name,
+                    output_index,
+                    node.make_loader()(args[0]).value,
+                )
+
+            body = LoopBody(
+                fn,
+                (list(var_ranges.keys()), ()),
+                var_ranges,
+                list(var_ranges.keys()),
+                tuple(),
+            )
+            bodies.append(body)
+            var_sizes_list.append(var_sizes)
+
+        cpp_kernel_proxy.codegen_loop_bodies(bodies, var_sizes_list)
+
+        def max_parallel_depth():
+            return ParallelDepth(parallel_depth=0, start_depth=0)
+
+        # This loop is not parallelized since it is not the outermost loop.
+        with patch.object(
+            cpp_kernel_proxy.loop_nest, "max_parallel_depth", max_parallel_depth
+        ):
+            kernel_group.finalize_kernel(cpp_kernel_proxy, [])
+        self.epilogue_code = kernel_group.loops_code
+        return self.epilogue_post_process(self.epilogue_code)
+
+
+    def write_epilogue_index(self, tile_row, tile_col, ldc) -> str:
+        index_terms = []
+        index_terms.append(f"{tile_row} * 16 * {ldc}")
+        index_terms.append(f"{tile_col} * 16")
+        return " + ".join(index_terms)
+
+    def store_epilogues(
+        self,
+        kernel,
+        # dst,
+        # local_acc: str,
+        num_rows: int,
+        num_cols: int,
+        epilogue_nodes: list[ir.Node],
+    ):
+        # TODO need determine scalar or vec kernel
+        if not epilogue_nodes:
+            return ""
+        if hasattr(self, "epilogue_code"):
+            return self.epilogue_post_process(self.epilogue_code)
+        # local_acc = epilogue_nodes[0]
+        with EpilogueBufferContext(kernel.args, self.fake_buffers) as scope:
+            self.scope = scope
+            # TODO get epilogue node load bufs
+            # rw = node.get_read_writes()
+            # read_deps = rw.reads          # List[Dep]
+            # write_deps = rw.writes
+            # input_buffer_names = [d.name for d in read_deps]
+            # node_input = V.graph.get_buffer("buf2")
+            # input_buffer_names.append(node_input.name)
+            # output_buffer_names = [d.name for d in write_deps]
+            # use epilogue map {"inputname": "epilogue_input0"}
+
+            # only need to rewrite index: xxxx -> prr + {{tile_row * 16}} * ld + {{tile_col * 16}}
+            # scope.add_local_buffer(
+            #     local_acc,
+            #     [
+            #         dst,
+            #     ],
+            # )
+            scope.epilogue_inputs = []
+            scope.epilogue_outputs = []
+            scope.local_acc = []
+            for node in epilogue_nodes:
+                rw = node.get_read_writes()
+                read_deps = rw.reads  # List[Dep]
+                write_deps = rw.writes
+                for d in read_deps:
+                    if d.name in self.fake_buffers_name:
+                        for buf in self.fake_buffers:
+                            if "GemmOut" in d.name:
+                                scope.local_acc.append(buf.name)
+                            if buf.get_name() == d.name:
+                                scope.epilogue_inputs.append(buf)
+                                break
+                    else:
+                        scope.epilogue_inputs.append(V.graph.get_buffer(d.name))
+                    # self.epilogue_inputs(kernel.slice_nd(d, [("INDEX_PLACEHOLDER_0", tile_row), (0, tile_col)]))
+                    # in_buf = V.graph.get_buffer(d.name)
+                    # if len(in_buf.get_size()) == 1:
+                    #     scope.epilogue_global_to_local[in_buf] = kernel.slice_nd(
+                    #         in_buf,
+                    #         [("INDEX_PLACEHOLDER_N_START", "INDEX_PLACEHOLDER_N_END")],
+                    #     )
+                    # else:
+                    #     scope.epilogue_global_to_local[in_buf] = kernel.slice_nd(
+                    #         in_buf,
+                    #         [
+                    #             ("INDEX_PLACEHOLDER_M_START", "INDEX_PLACEHOLDER_M_END"),
+                    #             ("INDEX_PLACEHOLDER_N_START", "INDEX_PLACEHOLDER_N_END"),
+                    #         ],
+                    #     )
+                # for d in write_deps:
+                #     if d.name in self.fake_buffers_name:
+                #         for buf in self.fake_buffers:
+                #             if buf.get_name() == d.name:
+                #                 scope.epilogue_outputs.append(buf)
+                #                 break
+                #     else:
+                #         scope.epilogue_outputs.append(V.graph.get_buffer(d.name))
+                    # self.epilogue_outputs(
+                    # out_buf = V.graph.get_buffer(d.name)
+                    # if len(out_buf.get_size()) == 1:
+                    #     scope.epilogue_global_to_local[out_buf] = kernel.slice_nd(
+                    #         out_buf,
+                    #         [("INDEX_PLACEHOLDER_N_START", "INDEX_PLACEHOLDER_N_END")],
+                    #     )
+                    # else:
+                    #     scope.epilogue_global_to_local[out_buf] = kernel.slice_nd(
+                    #         out_buf,
+                    #         [
+                    #             ("INDEX_PLACEHOLDER_M_START", "INDEX_PLACEHOLDER_M_END"),
+                    #             ("INDEX_PLACEHOLDER_N_START", "INDEX_PLACEHOLDER_N_END"),
+                    #         ],
+                    #     )
+
+            epilogue_nodes = scope.localize_nodes(epilogue_nodes)
+            return self.store_epilogue_nodes(
+                kernel,
+                # dst,
+                epilogue_nodes,  # type: ignore[arg-type]
+                num_rows,
+                num_cols,
+                # reindexers,
+            )
+        # load_C = f"C + {tile_row * 16} * {ldc} + {tile_col * 16}"
+        # lines: list[str] = []
+        # # Example (placeholder) – customize as needed:
+        # # for n, node in enumerate(epilogue_nodes):
+        # #     lines.append(f"// epilogue node {n}: {node}")
+        # return "\n".join(lines)
 
 # extra check for CppMicroBrgemm
 def check_brgemm_extra(config, m, n, k, alpha, num_threads, **kwargs):

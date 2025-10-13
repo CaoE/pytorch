@@ -395,6 +395,9 @@ class CppTemplateKernel(CppKernel):
            c) If `src` is local, we need to add a local buffer for it and localize the `orig_src` buffer
               in `epilogue_nodes` with `src`.
         """
+
+        # debug store output
+        
         assert isinstance(dst, (ir.Buffer, ir.ReinterpretView))
         assert dst.get_size() == src.get_size(), f"{dst=}, {src=}"
         if offsets:
