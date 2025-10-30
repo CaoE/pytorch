@@ -4,7 +4,10 @@ import operator
 import sys
 from collections.abc import Callable
 from enum import Enum
-from typing import Optional
+
+from typing import Any, Callable, Optional
+
+import sympy
 
 import torch
 
@@ -25,6 +28,8 @@ from .common import KernelTemplate
 from .cpp_template_kernel import CppTemplateKernel
 from .cpp_utils import DTYPE_TO_CPP, GemmBlocking, value_to_cpp
 
+from .common import RemovedArg
+from ..lowering import view
 
 class LayoutType(Enum):
     NORMAL = 0
@@ -1212,8 +1217,34 @@ class CppMicroGemmAMX(CppMicroGemm):
     It supports input types of torch.bfloat16 with fp32 output.
     """
 
+    DECLARE_EPILOGUE_KERNEL = r"""
+template <bool accum, bool horizontal_transverse, bool do_epilogue, bool prefetch=false>
+inline void {{kernel_name}}(
+{%- if kernel_extra_args_declare %}
+    {{kernel_extra_args_declare}}
+{%- endif %}
+    const {{input_t}}* {{restrict_keyword}} A,
+    const {{input2_t}}* {{restrict_keyword}} B,
+    {{output_t}}* {{restrict_keyword}} C,
+    {{store_t}}* {{restrict_keyword}} Y,
+    EPILOGUE_DEFINE_PLACEHOLDER
+    int64_t M,
+    int64_t N,
+    int64_t K,
+    int64_t lda,
+    int64_t ldb,
+    int64_t ldc,
+    int64_t ldy
+)
+"""
+
+
     TEMPLATE_ENTRY = r"""
+{%- if enable_epilogue %}
+{{declare_epilogue_kernel}} {
+{%- else %}
 {{declare_kernel}} {
+{%- endif %}
     {{kernel.assert_function}}(N % {{block_n}} == 0, "N dimension must be multiple of {{block_n}}");
     {{kernel.assert_function}}(K % 2 == 0, "K dimension must be multiple of 2");
 {%- if pack_vnni_B_locally %}
@@ -1297,7 +1328,11 @@ class CppMicroGemmAMX(CppMicroGemm):
             else
     {%- endif %}
             if (block_m >= {{num_rows}}) {
+{%- if enable_epilogue %}
+                {{kernel_name}}_amx_kernel_{{num_rows}}_{{num_columns}}<accum, horizontal_transverse, do_epilogue>(
+{%- else %}
                 {{kernel_name}}_amx_kernel_{{num_rows}}_{{num_columns}}<accum, horizontal_transverse>(
+{%- endif %}
                     amx_state,
                     A + m * lda,
 {%- if use_cached_dequantized_B %}
@@ -1308,10 +1343,18 @@ class CppMicroGemmAMX(CppMicroGemm):
                     B + n,
 {%- endif %}
                     C + m * ldc + n,
+{%- if enable_epilogue %}
+                    Y + m * ldy + n,
+                    N_pad,
+                    EPILOGUE_OFFSET_PLACEHOLDER
+{%- endif %}
                     K,
                     lda,
                     updated_ldb,
                     ldc,
+{%- if enable_epilogue %}
+                    ldy,
+{%- endif %}
                     16
                 );
                 block_m -= {{num_rows}};
@@ -1319,7 +1362,11 @@ class CppMicroGemmAMX(CppMicroGemm):
             }
 {%- endfor %}
             if (block_m > 0) {
+{%- if enable_epilogue %}
+                {{kernel_name}}_amx_kernel_16_{{num_columns}}<accum, horizontal_transverse, do_epilogue>(
+{%- else %}
                 {{kernel_name}}_amx_kernel_16_{{num_columns}}<accum, horizontal_transverse>(
+{%- endif %}
                     amx_state,
                     A + m_tail * lda,
 {%- if use_cached_dequantized_B %}
@@ -1330,10 +1377,18 @@ class CppMicroGemmAMX(CppMicroGemm):
                     B + n,
 {%- endif %}
                     C + m_tail * ldc + n,
+{%- if enable_epilogue %}
+                    Y + m * ldy + n,
+                    N_pad,
+                    EPILOGUE_OFFSET_PLACEHOLDER
+{%- endif %}
                     K,
                     lda,
                     updated_ldb,
                     ldc,
+{%- if enable_epilogue %}
+                    ldy,
+{%- endif %}
                     block_m
                 );
             }
@@ -1344,7 +1399,11 @@ class CppMicroGemmAMX(CppMicroGemm):
 
     TEMPLATE_KERNEL = r"""
 
+{%- if enable_epilogue %}
+template <bool accum, bool horizontal_transverse, bool do_epilogue, bool prefetch=false>
+{%- else %}
 template <bool accum, bool horizontal_transverse, bool prefetch=false>
+{%- endif %}
 inline void {{kernel_name}}_amx_kernel_{{num_rows}}_{{num_columns}}(
     AMXState& amx_state,
     const {{input_t}}* {{restrict_keyword}} A,
@@ -1354,18 +1413,30 @@ inline void {{kernel_name}}_amx_kernel_{{num_rows}}_{{num_columns}}(
     const {{input2_t}}* {{restrict_keyword}} B,
 {%- endif %}
     {{output_t}}* {{restrict_keyword}} C,
+{%- if enable_epilogue %}
+    {{store_t}}* {{restrict_keyword}} Y,
+    EPILOGUE_DEFINE_PLACEHOLDER
+{%- endif %}
     int64_t K,
     int64_t lda,
     int64_t ldb,
     int64_t ldc,
+{%- if enable_epilogue %}
+    int64_t ldy,
+{%- endif %}
     uint8_t tilecfg_rows
 ) {
-    // TODO(jgong5): add prefetch hint for A, B, C
     auto loadconfig = [](const amx_tilecfg& cfg) {
         _tile_loadconfig(&cfg);
     };
     const auto last_k_offset = K / {{block_k}} * {{block_k}};
     const auto tail_k_size = K - last_k_offset;
+{%- if enable_epilogue %}
+    // epilogue loop params
+    constexpr int m_start = 0;
+    int m_end = tilecfg_rows < 16 ? tilecfg_rows : {{num_rows}};
+    int Nr = {{num_columns}} * 16 - N_pad;
+{%- endif %}
     if C10_LIKELY (last_k_offset > 0) {
         amx_state.configure(tilecfg_rows, 64, {{num_rows}} / 16, {{num_columns}}, loadconfig);
     } else {
@@ -1450,6 +1521,12 @@ inline void {{kernel_name}}_amx_kernel_{{num_rows}}_{{num_columns}}(
         _tile_stored({{tile_idx}}, C + {{tile_row * 16}} * ldc + {{tile_col * 16}}, ldc * sizeof({{output_t}}));
     {%- endfor %}
 {%- endfor %}
+{%- if enable_epilogue %}
+    if constexpr (do_epilogue) {
+        {{kernel.unroll_pragma(4)}}
+        EPILOGUE_STORE_PLACEHOLDER
+    }
+{%- endif %}
     };
 
     // TODO(jgong5): move tail k computation to separate loopnest to save tile configuration overhead
@@ -1466,7 +1543,7 @@ inline void {{kernel_name}}_amx_kernel_{{num_rows}}_{{num_columns}}(
 }
 """
 
-    def codegen_define(self, kernel: CppTemplateKernel) -> str:
+    def codegen_define(self, kernel: CppTemplateKernel, fake_buffers=None, epilogue_nodes=None) -> str:
         block_m, block_n, block_k = self.register_blocking
         assert block_m % 16 == 0, "Only support block_m % 16 == 0 for AMX"
         assert block_n % 16 == 0, "Only support block_n % 16 == 0 for AMX"
@@ -1475,6 +1552,16 @@ inline void {{kernel_name}}_amx_kernel_{{num_rows}}_{{num_columns}}(
         else:
             assert block_k == 32, "Only support block_k = 32 for AMX Bfloat16/Float16"
         num_columns = block_n // 16
+        store_dtype = self.output_dtype
+        extra_options = {}
+        if epilogue_nodes:
+            for buf in fake_buffers or []:
+                if "GemmOut" in buf.name:
+                    store_dtype = buf.get_layout().dtype
+            extra_options = {
+                "store_t": DTYPE_TO_CPP[store_dtype],
+            }
+            extra_options["declare_epilogue_kernel"] = self.get_epilogue_kernel_declaration(extra_options)
         options = {
             "declare_kernel": self.get_kernel_declaration(),
             "use_cached_dequantized_B": (
@@ -1487,8 +1574,17 @@ inline void {{kernel_name}}_amx_kernel_{{num_rows}}_{{num_columns}}(
             "block_k": block_k,
             "num_columns": num_columns,
             "restrict_keyword": get_restrict_keyword(),
+            "epilogue_nodes": epilogue_nodes,
+            "fake_buffers": fake_buffers,
+            "enable_epilogue": epilogue_nodes is not None,
+            **extra_options,
             **self.get_common_options(),
         }
+        if epilogue_nodes:
+            self.fake_buffers = fake_buffers
+            self.fake_buffers_name = []
+            for buf in self.fake_buffers:
+                self.fake_buffers_name.append(buf.get_name())
         result = ""
         for num_rows in range(block_m, 0, -16):
             amx_kernel_options = {**options, "num_rows": num_rows}
@@ -1498,6 +1594,42 @@ inline void {{kernel_name}}_amx_kernel_{{num_rows}}_{{num_columns}}(
         result += KernelTemplate._template_from_string(self.TEMPLATE_ENTRY).render(
             options
         )
+
+        if epilogue_nodes:
+            def declare_kernel_hook():
+                res = IndentedBuffer()
+                res.writeline(f"int64_t N_pad,")
+                for node in epilogue_nodes:
+                    rws = node.get_read_writes()
+                    for rd in rws.reads:
+                        if 'GemmOut' not in rd.name:
+                            arg_name = kernel.args.input(rd.name)
+                            arg = V.graph.get_buffer(rd.name)
+                            # with res.indent():
+                            res.writeline(f"const {DTYPE_TO_CPP[arg.get_dtype()]}* {arg_name},")
+                return res.getvalue()
+
+            def epilogue_offset_placeholder():
+                res = IndentedBuffer()
+
+                for node in epilogue_nodes:
+                    rws = node.get_read_writes()
+                    for rd in rws.reads:
+                        if 'GemmOut' not in rd.name:
+                            arg_name = kernel.args.input(rd.name)
+                            arg = V.graph.get_buffer(rd.name)
+                            with res.indent():
+                                if len(arg.get_size()) == 1:
+                                    res.writeline(f"{arg_name} + {arg.get_stride()[0]} * n,")
+                                else:
+                                    arg = ir.TensorBox.create(arg)
+                                    arg = view(arg, [-1, arg.get_size()[-1]])
+                                    assert len(arg.get_size()) == 2
+                                    res.writeline(f"{arg_name} + {arg.get_stride()[0]} * m + {arg.get_stride()[1]} * n,")
+                return res.getvalue()
+
+            kernel.render_hooks["EPILOGUE_DEFINE_PLACEHOLDER"] = declare_kernel_hook
+            kernel.render_hooks["EPILOGUE_OFFSET_PLACEHOLDER"] = epilogue_offset_placeholder
         return result
 
     def codegen_init(
@@ -1512,6 +1644,12 @@ inline void {{kernel_name}}_amx_kernel_{{num_rows}}_{{num_columns}}(
     ) -> str:
         return "amx_state.release([]() { _tile_release(); });"
 
+    def get_epilogue_kernel_declaration(self, extra_options: Optional[dict] = None):
+        options = self.get_common_options()
+        if extra_options:
+            options = {**options, **extra_options}
+        return KernelTemplate._template_from_string(self.DECLARE_EPILOGUE_KERNEL).render(options)
+
     def get_kernel_extra_args_declare(self) -> str:
         return "AMXState& amx_state,"
 
@@ -1524,6 +1662,174 @@ inline void {{kernel_name}}_amx_kernel_{{num_rows}}_{{num_columns}}(
         else:
             return LayoutType.VNNI2
 
+    def codegen_call_with_epilogue(
+        self,
+        kernel: CppTemplateKernel,
+        A: ir.Buffer,
+        B: ir.Buffer,
+        C: ir.Buffer,
+        Y: ir.Buffer,
+        accum: bool,
+        do_epilogue: bool = True,
+        epilogue_store: Optional[str] = None,
+        epilogue_nodes: Optional[list[ir.IRNode]] = None,
+        offsets: Optional[tuple[str]] = None,
+        horizontal_transverse: bool = False,
+        prefetch: bool = False,
+        **kwargs_for_extra_args,
+    ) -> str:
+        """
+        Generate the code for calling the templated kernel that computes
+        `C += alpha * A @ B` if `accum` is True, or `C = alpha * A @ B` otherwise.
+        """
+        self.C = C
+        A_ptr = f"&({kernel.index(A, [0, 0])})"
+        B_ptr = f"&({kernel.index(B, [0, 0])})"
+        C_ptr = f"&({kernel.index(C, [0, 0])})"
+        Y_ptr = f"&({kernel.index(Y, [0, 0])})"
+        M = kernel.size(C, 0)
+        N = kernel.size(C, 1)
+        K = kernel.size(A, 1)
+        lda = kernel.stride(A, 0)
+        ldb = kernel.stride(B, 0)
+        ldc = kernel.stride(C, 0)
+        ldy = kernel.stride(Y, 0)
+        res = IndentedBuffer()
+        res.writeline(
+            f"{self.name}<{value_to_cpp(accum, 'bool')}, {value_to_cpp(horizontal_transverse, 'bool')}, {value_to_cpp(do_epilogue, 'bool')}, {value_to_cpp(prefetch, 'bool')}>("
+        )
+        def offsets_to_str(offsets):
+            if offsets is None:
+                return ""
+            return ", ".join(map(str, offsets))
+        with res.indent():
+            kwargs_for_extra_args.update({"kernel": kernel})
+            extra_args = self.get_kernel_extra_args(**kwargs_for_extra_args)
+            for arg in extra_args:
+                res.writeline(arg)
+            res.writeline(f"{A_ptr},")
+            res.writeline(f"{B_ptr},")
+            res.writeline(f"{C_ptr},")
+            res.writeline(f"{Y_ptr},")
+            res.writeline("EPILOGUE_CALL_PLACEHOLDER" + offsets_to_str(offsets) if epilogue_nodes else "")
+            res.writeline(f"{M},")
+            res.writeline(f"{N},")
+            res.writeline(f"{K},")
+            res.writeline(f"{lda},")
+            res.writeline(f"{ldb},")
+            res.writeline(f"{ldc},")
+            res.writeline(f"{ldy}")
+        res.writeline(");")
+
+        def arg_hook():
+            res = IndentedBuffer()
+            with res.indent():
+                res.writeline("N_pad,")
+            for node in epilogue_nodes:
+                rws = node.get_read_writes()
+
+                for rd in rws.reads:
+                    if 'GemmOut' not in rd.name:
+                        arg = None
+                        if rd.name in self.fake_buffers_name:
+                            for buf in self.fake_buffers:
+                                if buf.get_name() == rd.name:
+                                    arg = buf
+                                    break
+                        else:
+                            arg = V.graph.get_buffer(rd.name)
+
+                        if arg is not None:
+                            if len(arg.get_size()) == 2:
+                                arg_ptr = f"&({kernel.index(arg, [offsets[0], offsets[1]])})"
+                            elif len(arg.get_size()) == 1:
+                                arg_ptr = f"&({kernel.index(arg, [offsets[1]])})"
+                            else:
+                                arg = ir.TensorBox.create(arg)
+                                arg = view(arg, [-1, arg.get_size()[-1]])
+                                assert len(arg.get_size()) == 2
+                                arg_ptr = f"&({kernel.index(arg, [offsets[0], offsets[1]])})"
+
+                            with res.indent():
+                                res.writeline(f"{arg_ptr},")
+            return res.getvalue()
+
+        def epilogue_store_hook():
+            res = IndentedBuffer()
+            if epilogue_store is not None:
+                epilogue_store._lines = self.epilogue_post_process(epilogue_store._lines)
+                with res.indent():
+                    epilogue_final_store = epilogue_store.getvalue()
+                    res.writeline(epilogue_final_store)
+            return res.getvalue()
+
+        kernel.render_hooks["EPILOGUE_CALL_PLACEHOLDER" + offsets_to_str(offsets)] = arg_hook
+        kernel.render_hooks["EPILOGUE_STORE_PLACEHOLDER"] = epilogue_store_hook
+        return res.getvalue()
+
+    def epilogue_post_process(self, code_lines):
+        import re
+
+        code_lines
+        if_start = 0
+        for i, line in enumerate(code_lines):
+            if "if(C10_LIKELY" in line:
+                if_start = i
+            if if_start > 0:
+                if (type(line) == str and line.strip() == "}"):
+                    if_end = i
+                    break
+
+
+        inner_lines = code_lines[if_start + 2:if_end]
+        for i, line in enumerate(inner_lines):
+            if not isinstance(line, str):
+                line = line.line
+            if "local_acc_buf" in line:
+                inner_lines[i] = re.sub(r'local_acc_buf[^,]*,', 'C + (x0 * ldc + x1),', line)
+            if "store(Y" in line:
+                if re.search(r'Y[^,]*,', line):
+                    new_line = re.sub(r'Y[^,]*,', 'Y + (x0 * ldy + x1),', line)
+                else:
+                    new_line = re.sub(r'Y.*?\);', 'Y + (x0 * ldy + x1));', line)
+                inner_lines[i] = new_line
+
+        # Find consecutive 'store(Y,' lines at the end of inner_lines
+        end_idx = len(inner_lines) - 1
+        while end_idx >= 0 and isinstance(inner_lines[end_idx], str) and "store(Y" in inner_lines[end_idx]:
+            end_idx -= 1
+        # If there are at least two consecutive 'store(Y,' at the end, remove all but the last one
+        start_idx = end_idx + 1
+        num_consecutive = len(inner_lines) - start_idx
+        if num_consecutive > 1:
+            for i in range(start_idx, len(inner_lines) - 1):
+                inner_lines[i] = ""
+
+        brack_stack = []
+        for_list = []
+        for i, line in enumerate(code_lines):
+            if "for(" in line and "{" in code_lines[i+1]:
+                for_list.append(i)
+                for_list.append(i + 1)
+                brack_stack.append("for{")
+            if "{" in line and ("for(" not in code_lines[i-1]):
+                brack_stack.append("scope{")
+            if "}" in line and len(brack_stack) > 0:
+                if brack_stack[-1] == "for{":
+                    for_list.append(i)
+                brack_stack.pop()
+
+        assert len(for_list) % 3 == 0
+        for_liners_start = []
+        for idx in range(0, len(for_list) // 3):
+            for_liners_start.append(code_lines[for_list[idx * 2]])
+            for_liners_start.append(code_lines[for_list[idx * 2 + 1]])
+        for_liners_end = []
+        for_liners_end.append(code_lines[for_list[-2]])
+        for_liners_end.append(code_lines[for_list[-1]])
+        new_code_lines = for_liners_start + inner_lines + for_liners_end
+
+        return new_code_lines
 
 # extra check for CppMicroBrgemm
 def check_brgemm_extra(config, m, n, k, alpha, num_threads, **kwargs):
