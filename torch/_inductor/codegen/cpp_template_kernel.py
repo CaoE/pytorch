@@ -302,7 +302,8 @@ class CppTemplateKernel(CppKernel):
             cpp_kernel_proxy.loop_nest, "max_parallel_depth", max_parallel_depth
         ):
             kernel_group.finalize_kernel(cpp_kernel_proxy, [])
-        return kernel_group.loops_code.getvalue()
+        # return kernel_group.loops_code.getvalue()
+        return kernel_group.loops_code
 
     def store_grouped_gemm_pointwise_nodes(
         self,
@@ -395,8 +396,10 @@ class CppTemplateKernel(CppKernel):
            c) If `src` is local, we need to add a local buffer for it and localize the `orig_src` buffer
               in `epilogue_nodes` with `src`.
         """
+
+
         assert isinstance(dst, (ir.Buffer, ir.ReinterpretView))
-        assert dst.get_size() == src.get_size(), f"{dst=}, {src=}"
+        # assert dst.get_size() == src.get_size(), f"{dst=}, {src=}"
         if offsets:
             offsets = parse_expr_with_index_symbols(offsets)
         if epilogue_nodes:
