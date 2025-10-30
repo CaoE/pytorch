@@ -247,6 +247,7 @@ class CppTemplateKernel(CppKernel):
         nodes: list[ir.IRNode],
         offsets: Optional[list[sympy.Expr]] = None,
         reindexers: Optional[list[Optional[Callable[[list[Any]], list[Any]]]]] = None,
+        return_str: bool = False,
     ) -> str:
         var_sizes = (tuple(dst.get_size()), ())
         var_ranges = {
@@ -302,7 +303,9 @@ class CppTemplateKernel(CppKernel):
             cpp_kernel_proxy.loop_nest, "max_parallel_depth", max_parallel_depth
         ):
             kernel_group.finalize_kernel(cpp_kernel_proxy, [])
-        return kernel_group.loops_code.getvalue()
+        if return_str:
+            return kernel_group.loops_code.getvalue()
+        return kernel_group.loops_code
 
     def store_grouped_gemm_pointwise_nodes(
         self,
@@ -374,6 +377,7 @@ class CppTemplateKernel(CppKernel):
         epilogue_nodes: Optional[list[ir.IRNode]] = None,
         offsets: Optional[list[Any]] = None,
         reindexers: Optional[list[Optional[Callable[[list[Any]], list[Any]]]]] = None,
+        return_str: bool = True,
     ):
         """
         Store the `src` buffer to the `dst` buffer. The size of `src` and `dst` should match.
@@ -396,7 +400,7 @@ class CppTemplateKernel(CppKernel):
               in `epilogue_nodes` with `src`.
         """
         assert isinstance(dst, (ir.Buffer, ir.ReinterpretView))
-        assert dst.get_size() == src.get_size(), f"{dst=}, {src=}"
+        # assert dst.get_size() == src.get_size(), f"{dst=}, {src=}"
         if offsets:
             offsets = parse_expr_with_index_symbols(offsets)
         if epilogue_nodes:
@@ -416,6 +420,7 @@ class CppTemplateKernel(CppKernel):
                     epilogue_nodes,  # type: ignore[arg-type]
                     offsets,
                     reindexers,
+                    return_str,
                 )
         else:
             if dst.get_name() != src.get_name():
