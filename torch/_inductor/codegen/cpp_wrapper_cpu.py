@@ -2373,10 +2373,16 @@ class CppWrapperCpu(PythonWrapperCodegen):
 
         # In AOT mode, we use a ProxyExecutor to run fallback kernels.
         if V.graph.aot_mode:
-            self.generate_fallback_kernel_with_runtime_lookup_aot(
+            # self.generate_fallback_kernel_with_runtime_lookup_aot(
+            #     op_overload,
+            #     raw_args,
+            #     output_args,
+            #     outputs,
+            # )
+            self.generate_fallback_kernel_with_runtime_lookup_nopython(
+                get_args,
                 op_overload,
-                raw_args,
-                output_args,
+                output_args,  # type: ignore[arg-type]
                 outputs,
             )
             return
