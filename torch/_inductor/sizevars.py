@@ -621,6 +621,7 @@ class SizeVarAllocator:
             return fallback
 
         try:
+            # print("---------out-------: ", out)
             return int(out)
         except Exception:
             log.debug("failed on: %s", out)

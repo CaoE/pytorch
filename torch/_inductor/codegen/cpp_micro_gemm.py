@@ -1312,7 +1312,9 @@ inline void {{kernel_name}}(
     const int64_t updated_ldb = ldb;
 {%- endif %}
     // TODO(jgong5): loop unroll for M and N
-    for (int64_t n = 0; n < N; n += {{block_n}}) {
+    if constexpr(horizontal_transverse) {
+    for (int64_t m = 0; m < M; m += {{block_m}}) {
+    
 {%- if pack_vnni_B_locally %}
         // Pack non-constant weights into VNNI interleaved format in packed_B_buf
         at::vec::pack_vnni2(B + n, packed_B_buf, ldb, K, {{block_n}});
@@ -1320,7 +1322,7 @@ inline void {{kernel_name}}(
         // Dequantize K * block_n int8 B elements into BF16
         load_dequantized_B(n);
 {%- endif %}
-        for (int64_t m = 0; m < M; m += {{block_m}}) {
+        for (int64_t n = 0; n < N; n += {{block_n}}) {
             int64_t block_m = std::min<int64_t>(M - m, {{block_m}});
             int64_t m_tail = m;
 {%- for num_rows in range(block_m, 0, -16) %}
@@ -1340,7 +1342,7 @@ inline void {{kernel_name}}(
 {%- elif pack_vnni_B_locally %}
                     packed_B_buf,
 {%- else %}
-                    B + n,
+                    B + n * {{ld_w}},
 {%- endif %}
                     C + m * ldc + n,
 {%- if enable_epilogue %}
@@ -1374,7 +1376,7 @@ inline void {{kernel_name}}(
 {%- elif pack_vnni_B_locally %}
                     packed_B_buf,
 {%- else %}
-                    B + n,
+                    B + n * {{ld_w}},
 {%- endif %}
                     C + m_tail * ldc + n,
 {%- if enable_epilogue %}
@@ -1393,6 +1395,92 @@ inline void {{kernel_name}}(
                 );
             }
         }
+    } 
+    }
+    else {
+
+    for (int64_t n = 0; n < N; n += {{block_n}}) {
+{%- if pack_vnni_B_locally %}
+        // Pack non-constant weights into VNNI interleaved format in packed_B_buf
+        at::vec::pack_vnni2(B + n, packed_B_buf, ldb, K, {{block_n}});
+{%- elif use_cached_dequantized_B %}
+        // Dequantize K * block_n int8 B elements into BF16
+        load_dequantized_B(n);
+{%- endif %}
+        for (int64_t m = 0; m < M; m += {{block_m}}) {
+            int64_t block_m = std::min<int64_t>(M - m, {{block_m}});
+            int64_t m_tail = m;
+{%- for num_rows in range(block_m, 0, -16) %}
+    {%- if num_rows != block_m %}
+            else
+    {%- endif %}
+            if (block_m >= {{num_rows}}) {
+{%- if enable_epilogue %}
+                {{kernel_name}}_amx_kernel_{{num_rows}}_{{num_columns}}<accum, horizontal_transverse, do_epilogue>(
+{%- else %}
+                {{kernel_name}}_amx_kernel_{{num_rows}}_{{num_columns}}<accum, horizontal_transverse>(
+{%- endif %}
+                    amx_state,
+                    A + m * lda,
+{%- if use_cached_dequantized_B %}
+                    dequantized_B_buf,
+{%- elif pack_vnni_B_locally %}
+                    packed_B_buf,
+{%- else %}
+                    B + n * {{ld_w}},
+{%- endif %}
+                    C + m * ldc + n,
+{%- if enable_epilogue %}
+                    Y + m * ldy + n,
+                    N_pad,
+                    EPILOGUE_OFFSET_PLACEHOLDER
+{%- endif %}
+                    K,
+                    lda,
+                    updated_ldb,
+                    ldc,
+{%- if enable_epilogue %}
+                    ldy,
+{%- endif %}
+                    16
+                );
+                block_m -= {{num_rows}};
+                m_tail += {{num_rows}};
+            }
+{%- endfor %}
+            if (block_m > 0) {
+{%- if enable_epilogue %}
+                {{kernel_name}}_amx_kernel_16_{{num_columns}}<accum, horizontal_transverse, do_epilogue>(
+{%- else %}
+                {{kernel_name}}_amx_kernel_16_{{num_columns}}<accum, horizontal_transverse>(
+{%- endif %}
+                    amx_state,
+                    A + m_tail * lda,
+{%- if use_cached_dequantized_B %}
+                    dequantized_B_buf,
+{%- elif pack_vnni_B_locally %}
+                    packed_B_buf,
+{%- else %}
+                    B + n * {{ld_w}},
+{%- endif %}
+                    C + m_tail * ldc + n,
+{%- if enable_epilogue %}
+                    Y + m * ldy + n,
+                    N_pad,
+                    EPILOGUE_OFFSET_PLACEHOLDER
+{%- endif %}
+                    K,
+                    lda,
+                    updated_ldb,
+                    ldc,
+{%- if enable_epilogue %}
+                    ldy,
+{%- endif %}
+                    block_m
+                );
+            }
+        }
+    }
     }
 }
 """
@@ -1543,7 +1631,7 @@ inline void {{kernel_name}}_amx_kernel_{{num_rows}}_{{num_columns}}(
 }
 """
 
-    def codegen_define(self, kernel: CppTemplateKernel, fake_buffers=None, epilogue_nodes=None) -> str:
+    def codegen_define(self, kernel: CppTemplateKernel, ld_w=None, fake_buffers=None, epilogue_nodes=None) -> str:
         block_m, block_n, block_k = self.register_blocking
         assert block_m % 16 == 0, "Only support block_m % 16 == 0 for AMX"
         assert block_n % 16 == 0, "Only support block_n % 16 == 0 for AMX"
@@ -1572,6 +1660,7 @@ inline void {{kernel_name}}_amx_kernel_{{num_rows}}_{{num_columns}}(
             "block_m": block_m,
             "block_n": block_n,
             "block_k": block_k,
+            "ld_w": ld_w,
             "num_columns": num_columns,
             "restrict_keyword": get_restrict_keyword(),
             "epilogue_nodes": epilogue_nodes,

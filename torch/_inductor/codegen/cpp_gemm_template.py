@@ -187,9 +187,9 @@ const int64_t nc_block_end = std::min(nc + Nc_blocks, n_block_end);
 GEMM_TEMPLATE_MICROKERNEL_DEF = r"""
 {{template.header().getvalue()}}
 {%- if epilogue_in_micro_gemm %}
-{{micro_gemm.codegen_define(kernel, fake_buffers, epilogue_nodes)}}
+{{micro_gemm.codegen_define(kernel, K, fake_buffers, epilogue_nodes)}}
 {%- else %}
-{{micro_gemm.codegen_define(kernel)}}
+{{micro_gemm.codegen_define(kernel, K)}}
 {%- endif %}
 """
 
@@ -252,10 +252,10 @@ GEMM_TEMPLATE = r"""
                         const int64_t m_start_i = mci;
                         const int64_t m_end_i = std::min(m_start_i + Mr, m_end);
 {%- set tile_X = kernel.slice_nd(X, [("m_start_i", "m_end_i"), ("k_start", "k_end")]) %}
-                        for (int64_t nci = nc; nci < nc_block_end; nci++) {
-{%- set acc_slice = kernel.slice_nd(acc, [("m_start_i - m_start", "m_end_i - m_start"), ("(nci - nc)*Nr", "(nci - nc + 1)*Nr")]) %}
+                        //for (int64_t nci = nc; nci < nc_block_end; nci++) {
+{%- set acc_slice = kernel.slice_nd(acc, [("m_start_i - m_start", "m_end_i - m_start"), ("0", "n_end - n_start")]) %}
 {%- if template.should_block_weights and not is_woq_int4 %}
-{%- set tile_W_3d = kernel.slice_nd(W, [("nci", "nci + 1"), ("k_start", "k_end"), ()]) %}
+{%- set tile_W_3d = kernel.slice_nd(W, [("nc", "nc + 1"), ("k_start", "k_end"), ()]) %}
 {%- set tile_W = kernel.view(tile_W_3d, ["k_end - k_start", micro_gemm.register_blocking.block_n]) %}
 {%- else %}
     {%- if is_woq_int4 %}
@@ -270,8 +270,8 @@ GEMM_TEMPLATE = r"""
 
 
                         {% if epilogue_in_micro_gemm %}
-                        N_pad = (nci + 1) * Nr > N ? (nci + 1) * Nr - N : 0;
-                        {%- set tile_Y = kernel.slice_nd(Y_2d, [("m_start_i", "m_end"), ("nci*Nr", "(nci+1)*Nr")]) %}
+                        N_pad = (nc + Nc_blocks) * Nr > N ? (nc + Nc_blocks) * Nr - N : 0;
+                        {%- set tile_Y = kernel.slice_nd(Y_2d, [("m_start_i", "m_end"), ("n_start", "n_end")]) %}
                         if (kc == k_block_start) {
                             if (kc + Kc_blocks < k_block_end) {
                                 {{ micro_gemm.codegen_call_with_epilogue(kernel,
@@ -288,7 +288,7 @@ GEMM_TEMPLATE = r"""
                                                                                             reindexers=reindexers,
                                                                                             return_str=False),
                                                         epilogue_nodes=epilogue_nodes,
-                                                        offsets=("m_start_i", "nci*Nr"),
+                                                        offsets=("m_start_i", "n_start"),
                                                         horizontal_transverse=True,
                                                         qscale_and_zeros=tile_qparam)|indent(28, false)
                                 }}
@@ -307,7 +307,7 @@ GEMM_TEMPLATE = r"""
                                                                                             reindexers=reindexers,
                                                                                             return_str=False),
                                                         epilogue_nodes=epilogue_nodes,
-                                                        offsets=("m_start_i", "nci*Nr"),
+                                                        offsets=("m_start_i", "n_start"),
                                                         horizontal_transverse=True,
                                                         qscale_and_zeros=tile_qparam)|indent(28, false)
                                 }}
@@ -327,7 +327,7 @@ GEMM_TEMPLATE = r"""
                                                                                           reindexers=reindexers,
                                                                                           return_str=False),
                                                        epilogue_nodes=epilogue_nodes,
-                                                       offsets=("m_start_i", "nci*Nr"),
+                                                       offsets=("m_start_i", "n_start"),
                                                        horizontal_transverse=True,
                                                        qscale_and_zeros=tile_qparam)|indent(28, false)
                             }}
@@ -346,7 +346,7 @@ GEMM_TEMPLATE = r"""
                                                                                           reindexers=reindexers,
                                                                                           return_str=False),
                                                        epilogue_nodes=epilogue_nodes,
-                                                       offsets=("m_start_i", "nci*Nr"),
+                                                       offsets=("m_start_i", "n_start"),
                                                        horizontal_transverse=True,
                                                        qscale_and_zeros=tile_qparam)|indent(28, false)
                             }}
@@ -368,7 +368,7 @@ GEMM_TEMPLATE = r"""
                     {%- endif %}
 
 
-                        }
+                        //}
                     }
                 }
 {%- if maybe_k_slicing %}
@@ -1203,24 +1203,25 @@ class CppGemmTemplate(CppTemplate):
                 Mc_blocks, Nc_blocks, Kc_blocks = blockings
                 blockings = min(Mc_blocks, Mt_blocks), min(Nc_blocks, Nt_blocks), min(Kc_blocks, Kt_blocks)
 
-            if _use_cpp_gemm_strategy("VERTICAL") and _use_cpp_gemm_strategy("HORIZONTAL"):
-                if blockings:
-                    vertical_blocking, horizental_blocking = blockings, blockings
-                else:
-                    vertical_blocking = _get_cache_block_of_vertical_transverse()
-                    horizental_blocking = _get_cache_block_of_horizontal_transverse()
-                horizontal_transverse = _choose_horizental_and_vertical(vertical_blocking, horizental_blocking)
-                if horizontal_transverse:
-                    blockings = horizental_blocking
-                else:
-                    blockings = vertical_blocking
-            elif _use_cpp_gemm_strategy("VERTICAL"):
-                blockings = _get_cache_block_of_vertical_transverse()
-                horizontal_transverse = False
-            else:
-                assert _use_cpp_gemm_strategy("HORIZONTAL")
-                blockings = _get_cache_block_of_horizontal_transverse()
-                horizontal_transverse = True
+            # if _use_cpp_gemm_strategy("VERTICAL") and _use_cpp_gemm_strategy("HORIZONTAL"):
+            #     if blockings:
+            #         vertical_blocking, horizental_blocking = blockings, blockings
+            #     else:
+            #         vertical_blocking = _get_cache_block_of_vertical_transverse()
+            #         horizental_blocking = _get_cache_block_of_horizontal_transverse()
+            #     horizontal_transverse = _choose_horizental_and_vertical(vertical_blocking, horizental_blocking)
+            #     if horizontal_transverse:
+            #         blockings = horizental_blocking
+            #     else:
+            #         blockings = vertical_blocking
+            # elif _use_cpp_gemm_strategy("VERTICAL"):
+            #     blockings = _get_cache_block_of_vertical_transverse()
+            #     horizontal_transverse = False
+            # else:
+            # assert _use_cpp_gemm_strategy("HORIZONTAL")
+            blockings = _get_cache_block_of_horizontal_transverse()
+            horizontal_transverse = True
+            # horizontal_transverse=True
             return GemmBlocking(*blockings), value_to_cpp(horizontal_transverse, "bool")
 
         assert not self.is_dynamic_M, (
@@ -1914,8 +1915,8 @@ class CppGemmTemplate(CppTemplate):
         L2_cache_size = torch._C._cpu._L2_cache_size()  # per core cache size in Bytes
         assert L2_cache_size > 0, f"Expect L2_cache_size > 0 but got {L2_cache_size}"
 
-        epilogue_in_micro_gemm = self.n % 16 == 0
-        # epilogue_in_micro_gemm = False
+        # epilogue_in_micro_gemm = self.n % 16 == 0
+        epilogue_in_micro_gemm = False
         options = dict(
             X=X,
             W=W,
