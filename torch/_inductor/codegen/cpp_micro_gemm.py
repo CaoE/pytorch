@@ -1311,6 +1311,12 @@ inline void {{kernel_name}}(
 {%- else %}
     const int64_t updated_ldb = ldb;
 {%- endif %}
+{%- if enable_epilogue %}
+    {{output_t}}* C_pre=nullptr;
+    {{store_t}}* Y_pre=nullptr;
+    INIT_PRE_PARAS
+    int64_t pre_rows=0;
+{%- endif %}
     // TODO(jgong5): loop unroll for M and N
     if constexpr(horizontal_transverse) {
     for (int64_t m = 0; m < M; m += {{block_m}}) {
@@ -1322,7 +1328,6 @@ inline void {{kernel_name}}(
         // Dequantize K * block_n int8 B elements into BF16
         load_dequantized_B(n);
 {%- endif %}
-        for (int64_t n = 0; n < N; n += {{block_n}}) {
             int64_t block_m = std::min<int64_t>(M - m, {{block_m}});
             int64_t m_tail = m;
 {%- for num_rows in range(block_m, 0, -16) %}
@@ -1330,6 +1335,7 @@ inline void {{kernel_name}}(
             else
     {%- endif %}
             if (block_m >= {{num_rows}}) {
+            for (int64_t n = 0; n < N; n += {{block_n}}) {
 {%- if enable_epilogue %}
                 {{kernel_name}}_amx_kernel_{{num_rows}}_{{num_columns}}<accum, horizontal_transverse, do_epilogue>(
 {%- else %}
@@ -1346,9 +1352,10 @@ inline void {{kernel_name}}(
 {%- endif %}
                     C + m * ldc + n,
 {%- if enable_epilogue %}
-                    Y + m * ldy + n,
+                    C_pre,
+                    Y_pre,
                     N_pad,
-                    EPILOGUE_OFFSET_PLACEHOLDER
+                    EPILOGUE_PRE_PLACEHOLDER
 {%- endif %}
                     K,
                     lda,
@@ -1356,14 +1363,23 @@ inline void {{kernel_name}}(
                     ldc,
 {%- if enable_epilogue %}
                     ldy,
+                    pre_rows,
 {%- endif %}
                     16
                 );
+{%- if enable_epilogue %}
+                C_pre = C + m * ldc + n;
+                Y_pre = Y + m * ldy + n;
+                EPILOGUE_OFFSET_PLACEHOLDER
+                pre_rows={{num_rows}};
+{%- endif %}
+                }
                 block_m -= {{num_rows}};
                 m_tail += {{num_rows}};
             }
 {%- endfor %}
             if (block_m > 0) {
+            for (int64_t n = 0; n < N; n += {{block_n}}) {
 {%- if enable_epilogue %}
                 {{kernel_name}}_amx_kernel_16_{{num_columns}}<accum, horizontal_transverse, do_epilogue>(
 {%- else %}
@@ -1380,9 +1396,10 @@ inline void {{kernel_name}}(
 {%- endif %}
                     C + m_tail * ldc + n,
 {%- if enable_epilogue %}
-                    Y + m * ldy + n,
+                    C_pre,
+                    Y_pre,
                     N_pad,
-                    EPILOGUE_OFFSET_PLACEHOLDER
+                    EPILOGUE_PRE_PLACEHOLDER
 {%- endif %}
                     K,
                     lda,
@@ -1390,9 +1407,16 @@ inline void {{kernel_name}}(
                     ldc,
 {%- if enable_epilogue %}
                     ldy,
+                    pre_rows,
 {%- endif %}
                     block_m
                 );
+{%- if enable_epilogue %}
+                C_pre = C + m_tail * ldc + n;
+                Y_pre = Y + m_tail * ldy + n;
+                EPILOGUE_TAIL_OFFSET_PLACEHOLDER
+                pre_rows=block_m;
+{%- endif %}
             }
         }
     } 
@@ -1431,9 +1455,10 @@ inline void {{kernel_name}}(
 {%- endif %}
                     C + m * ldc + n,
 {%- if enable_epilogue %}
-                    Y + m * ldy + n,
+                    C_pre,
+                    Y_pre,
                     N_pad,
-                    EPILOGUE_OFFSET_PLACEHOLDER
+                    EPILOGUE_PRE_PLACEHOLDER
 {%- endif %}
                     K,
                     lda,
@@ -1441,14 +1466,22 @@ inline void {{kernel_name}}(
                     ldc,
 {%- if enable_epilogue %}
                     ldy,
+                    pre_rows,
 {%- endif %}
                     16
                 );
                 block_m -= {{num_rows}};
                 m_tail += {{num_rows}};
+{%- if enable_epilogue %}
+                C_pre = C + m * ldc + n;
+                Y_pre = Y + m * ldy + n;
+                EPILOGUE_OFFSET_PLACEHOLDER
+                pre_rows={{num_rows}};
+{%- endif %}
             }
 {%- endfor %}
             if (block_m > 0) {
+            
 {%- if enable_epilogue %}
                 {{kernel_name}}_amx_kernel_16_{{num_columns}}<accum, horizontal_transverse, do_epilogue>(
 {%- else %}
@@ -1465,9 +1498,10 @@ inline void {{kernel_name}}(
 {%- endif %}
                     C + m_tail * ldc + n,
 {%- if enable_epilogue %}
-                    Y + m * ldy + n,
+                    C_pre,
+                    Y_pre,
                     N_pad,
-                    EPILOGUE_OFFSET_PLACEHOLDER
+                    EPILOGUE_PRE_PLACEHOLDER
 {%- endif %}
                     K,
                     lda,
@@ -1475,13 +1509,29 @@ inline void {{kernel_name}}(
                     ldc,
 {%- if enable_epilogue %}
                     ldy,
+                    pre_rows,
 {%- endif %}
                     block_m
                 );
+{%- if enable_epilogue %}
+                C_pre = C + m_tail * ldc + n;
+                Y_pre = Y + m_tail * ldy + n;
+                EPILOGUE_TAIL_OFFSET_PLACEHOLDER
+                pre_rows=block_m;
+{%- endif %}
             }
         }
     }
     }
+
+ // epilogue
+{%- if enable_epilogue %}
+    constexpr int64_t m_start = 0;
+    int64_t m_end = pre_rows;
+    int Nr = {{num_columns}} * 16 - N_pad;
+    {{kernel.unroll_pragma(64)}}
+    EPILOGUE_STORE_PLACEHOLDER
+{%- endif %}
 }
 """
 
@@ -1502,6 +1552,7 @@ inline void {{kernel_name}}_amx_kernel_{{num_rows}}_{{num_columns}}(
 {%- endif %}
     {{output_t}}* {{restrict_keyword}} C,
 {%- if enable_epilogue %}
+    {{output_t}}* {{restrict_keyword}} C_pre,
     {{store_t}}* {{restrict_keyword}} Y,
     EPILOGUE_DEFINE_PLACEHOLDER
 {%- endif %}
@@ -1511,6 +1562,7 @@ inline void {{kernel_name}}_amx_kernel_{{num_rows}}_{{num_columns}}(
     int64_t ldc,
 {%- if enable_epilogue %}
     int64_t ldy,
+    int64_t pre_rows,
 {%- endif %}
     uint8_t tilecfg_rows
 ) {
@@ -1522,7 +1574,7 @@ inline void {{kernel_name}}_amx_kernel_{{num_rows}}_{{num_columns}}(
 {%- if enable_epilogue %}
     // epilogue loop params
     constexpr int m_start = 0;
-    int m_end = tilecfg_rows < 16 ? tilecfg_rows : {{num_rows}};
+    int m_end = pre_rows;
     int Nr = {{num_columns}} * 16 - N_pad;
 {%- endif %}
     if C10_LIKELY (last_k_offset > 0) {
@@ -1596,8 +1648,22 @@ inline void {{kernel_name}}_amx_kernel_{{num_rows}}_{{num_columns}}(
 {%- endfor %}
     };
 
+int k = 0;
+
+{%- if enable_epilogue %}
+    constexpr int block_k = {{block_k}};
+    if constexpr (do_epilogue) {
+        if(C_pre != nullptr && Y != nullptr) {
+            int i=0;
+            const int t=(m_end*2+K / {{block_k}}-1)/(K / {{block_k}});
+            {{kernel.unroll_pragma(64)}}
+            EPILOGUE_AMX_EPILOGUE_PLACEHOLDER
+        }
+    }
+{%- endif %}
+
     {{kernel.unroll_pragma(4)}}
-    for (int k = 0; k < last_k_offset; k += {{block_k}}) {
+    for (; k < last_k_offset; k += {{block_k}}) {
         compute(k);
     }
 
@@ -1609,12 +1675,6 @@ inline void {{kernel_name}}_amx_kernel_{{num_rows}}_{{num_columns}}(
         _tile_stored({{tile_idx}}, C + {{tile_row * 16}} * ldc + {{tile_col * 16}}, ldc * sizeof({{output_t}}));
     {%- endfor %}
 {%- endfor %}
-{%- if enable_epilogue %}
-    if constexpr (do_epilogue) {
-        {{kernel.unroll_pragma(4)}}
-        EPILOGUE_STORE_PLACEHOLDER
-    }
-{%- endif %}
     };
 
     // TODO(jgong5): move tail k computation to separate loopnest to save tile configuration overhead
@@ -1695,6 +1755,7 @@ inline void {{kernel_name}}_amx_kernel_{{num_rows}}_{{num_columns}}(
                             arg_name = kernel.args.input(rd.name)
                             arg = V.graph.get_buffer(rd.name)
                             # with res.indent():
+                            # res.writeline(f"const {DTYPE_TO_CPP[arg.get_dtype()]}* {arg_name},")
                             res.writeline(f"const {DTYPE_TO_CPP[arg.get_dtype()]}* {arg_name},")
                 return res.getvalue()
 
@@ -1709,16 +1770,70 @@ inline void {{kernel_name}}_amx_kernel_{{num_rows}}_{{num_columns}}(
                             arg = V.graph.get_buffer(rd.name)
                             with res.indent():
                                 if len(arg.get_size()) == 1:
-                                    res.writeline(f"{arg_name} + {arg.get_stride()[0]} * n,")
+                                    res.writeline(f"{arg_name}_pre = {arg_name} + {arg.get_stride()[0]} * n,")
                                 else:
                                     arg = ir.TensorBox.create(arg)
                                     arg = view(arg, [-1, arg.get_size()[-1]])
                                     assert len(arg.get_size()) == 2
-                                    res.writeline(f"{arg_name} + {arg.get_stride()[0]} * m + {arg.get_stride()[1]} * n,")
+                                    res.writeline(f"{arg_name}_pre = {arg_name}+ {arg.get_stride()[0]} * m + {arg.get_stride()[1]} * n,")
+                return res.getvalue()
+
+            def epilogue_tail_offset_placeholder():
+                res = IndentedBuffer()
+
+                for node in epilogue_nodes:
+                    rws = node.get_read_writes()
+                    for rd in rws.reads:
+                        if 'GemmOut' not in rd.name:
+                            arg_name = kernel.args.input(rd.name)
+                            arg = V.graph.get_buffer(rd.name)
+                            with res.indent():
+                                if len(arg.get_size()) == 1:
+                                    res.writeline(f"{arg_name}_pre = {arg_name} + {arg.get_stride()[0]} * n,")
+                                else:
+                                    arg = ir.TensorBox.create(arg)
+                                    arg = view(arg, [-1, arg.get_size()[-1]])
+                                    assert len(arg.get_size()) == 2
+                                    res.writeline(f"{arg_name}_pre = {arg_name}+ {arg.get_stride()[0]} * m_tail + {arg.get_stride()[1]} * n,")
+                return res.getvalue()
+
+            def epilogue_pre_placeholder():
+                res = IndentedBuffer()
+
+                for node in epilogue_nodes:
+                    rws = node.get_read_writes()
+                    for rd in rws.reads:
+                        if 'GemmOut' not in rd.name:
+                            arg_name = kernel.args.input(rd.name)
+                            arg = V.graph.get_buffer(rd.name)
+                            with res.indent():
+                                if len(arg.get_size()) == 1:
+                                    res.writeline(f"{arg_name}_pre,")
+                                else:
+                                    arg = ir.TensorBox.create(arg)
+                                    arg = view(arg, [-1, arg.get_size()[-1]])
+                                    assert len(arg.get_size()) == 2
+                                    res.writeline(f"{arg_name}_pre,")
+                return res.getvalue()
+
+            def init_pre_paras_hook():
+                res = IndentedBuffer()
+                for node in epilogue_nodes:
+                    rws = node.get_read_writes()
+                    for rd in rws.reads:
+                        if 'GemmOut' not in rd.name:
+                            arg_name = kernel.args.input(rd.name)
+                            arg = V.graph.get_buffer(rd.name)
+                            # with res.indent():
+                            # res.writeline(f"const {DTYPE_TO_CPP[arg.get_dtype()]}* {arg_name},")
+                            res.writeline(f"const {DTYPE_TO_CPP[arg.get_dtype()]}* {arg_name}_pre = nullptr;")
                 return res.getvalue()
 
             kernel.render_hooks["EPILOGUE_DEFINE_PLACEHOLDER"] = declare_kernel_hook
             kernel.render_hooks["EPILOGUE_OFFSET_PLACEHOLDER"] = epilogue_offset_placeholder
+            kernel.render_hooks["EPILOGUE_TAIL_OFFSET_PLACEHOLDER"] = epilogue_tail_offset_placeholder
+            kernel.render_hooks["EPILOGUE_PRE_PLACEHOLDER"] = epilogue_pre_placeholder
+            kernel.render_hooks["INIT_PRE_PARAS"] = init_pre_paras_hook
         return result
 
     def codegen_init(
@@ -1842,11 +1957,30 @@ inline void {{kernel_name}}_amx_kernel_{{num_rows}}_{{num_columns}}(
                             with res.indent():
                                 res.writeline(f"{arg_ptr},")
             return res.getvalue()
-
+        orig_lines = epilogue_store._lines.copy() if epilogue_store is not None else None
         def epilogue_store_hook():
             res = IndentedBuffer()
             if epilogue_store is not None:
-                epilogue_store._lines = self.epilogue_post_process(epilogue_store._lines)
+                _lines = self.epilogue_post_process(orig_lines)
+                for i, line in enumerate(_lines):
+                    for node in epilogue_nodes:
+                        rws = node.get_read_writes()
+                        for rd in rws.reads:
+                            if 'GemmOut' not in rd.name:
+                                arg_name = kernel.args.input(rd.name)
+                                if arg_name in line:
+                                    _lines[i] = line.replace(arg_name, f"{arg_name}_pre")
+                epilogue_store._lines = _lines
+                with res.indent():
+                    epilogue_final_store = epilogue_store.getvalue()
+                    res.writeline(epilogue_final_store)
+            return res.getvalue()
+        
+    
+        def amx_epilogue_store_hook():
+            res = IndentedBuffer()
+            if epilogue_store is not None:
+                epilogue_store._lines = self.epilogue_post_process(orig_lines, True)
                 with res.indent():
                     epilogue_final_store = epilogue_store.getvalue()
                     res.writeline(epilogue_final_store)
@@ -1854,13 +1988,15 @@ inline void {{kernel_name}}_amx_kernel_{{num_rows}}_{{num_columns}}(
 
         kernel.render_hooks["EPILOGUE_CALL_PLACEHOLDER" + offsets_to_str(offsets)] = arg_hook
         kernel.render_hooks["EPILOGUE_STORE_PLACEHOLDER"] = epilogue_store_hook
+        kernel.render_hooks["EPILOGUE_AMX_EPILOGUE_PLACEHOLDER"] = amx_epilogue_store_hook
         return res.getvalue()
 
-    def epilogue_post_process(self, code_lines):
+    def epilogue_post_process(self, orig_code_lines, amx_epilogue:bool=False):
         import re
 
-        code_lines
+        code_lines = orig_code_lines.copy()
         if_start = 0
+        if_end = len(code_lines)
         for i, line in enumerate(code_lines):
             if "if(C10_LIKELY" in line:
                 if_start = i
@@ -1875,12 +2011,21 @@ inline void {{kernel_name}}_amx_kernel_{{num_rows}}_{{num_columns}}(
             if not isinstance(line, str):
                 line = line.line
             if "local_acc_buf" in line:
-                inner_lines[i] = re.sub(r'local_acc_buf[^,]*,', 'C + (x0 * ldc + x1),', line)
+                if amx_epilogue:
+                    inner_lines[i] = re.sub(r'local_acc_buf[^,]*,', 'C_pre + (x0 * ldc + x1),', line)
+                else:
+                    inner_lines[i] = re.sub(r'local_acc_buf[^,]*,', 'C_pre + (x0 * ldc + x1),', line)
             if "store(Y" in line:
                 if re.search(r'Y[^,]*,', line):
-                    new_line = re.sub(r'Y[^,]*,', 'Y + (x0 * ldy + x1),', line)
+                    if amx_epilogue:
+                        new_line = re.sub(r'Y[^,]*,', 'Y + (x0 * ldy + x1),', line)
+                    else:
+                        new_line = re.sub(r'Y[^,]*,', 'Y_pre + (x0 * ldy + x1),', line)
                 else:
-                    new_line = re.sub(r'Y.*?\);', 'Y + (x0 * ldy + x1));', line)
+                    if amx_epilogue:
+                        new_line = re.sub(r'Y.*?\);', 'Y + (x0 * ldy + x1));', line)
+                    else:
+                        new_line = re.sub(r'Y.*?\);', 'Y_pre + (x0 * ldy + x1));', line)
                 inner_lines[i] = new_line
 
         # Find consecutive 'store(Y,' lines at the end of inner_lines
@@ -1916,6 +2061,15 @@ inline void {{kernel_name}}_amx_kernel_{{num_rows}}_{{num_columns}}(
         for_liners_end = []
         for_liners_end.append(code_lines[for_list[-2]])
         for_liners_end.append(code_lines[for_list[-1]])
+
+        if amx_epilogue:
+            amx_lines = []
+            amx_lines.append("              if((i++)%t==0){")
+            amx_lines.append("                  compute(k);")
+            amx_lines.append("                  k+=block_k;")
+            amx_lines.append("              }")
+            return for_liners_start + amx_lines + inner_lines + for_liners_end
+
         new_code_lines = for_liners_start + inner_lines + for_liners_end
 
         return new_code_lines

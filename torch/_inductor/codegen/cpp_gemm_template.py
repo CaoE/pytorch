@@ -1219,9 +1219,10 @@ class CppGemmTemplate(CppTemplate):
             #     horizontal_transverse = False
             # else:
             # assert _use_cpp_gemm_strategy("HORIZONTAL")
-            blockings = _get_cache_block_of_horizontal_transverse()
-            horizontal_transverse = True
-            # horizontal_transverse=True
+            # blockings = _get_cache_block_of_horizontal_transverse()
+            # horizontal_transverse = True
+            blockings = _get_cache_block_of_vertical_transverse()
+            horizontal_transverse = False
             return GemmBlocking(*blockings), value_to_cpp(horizontal_transverse, "bool")
 
         assert not self.is_dynamic_M, (
@@ -1915,8 +1916,8 @@ class CppGemmTemplate(CppTemplate):
         L2_cache_size = torch._C._cpu._L2_cache_size()  # per core cache size in Bytes
         assert L2_cache_size > 0, f"Expect L2_cache_size > 0 but got {L2_cache_size}"
 
-        # epilogue_in_micro_gemm = self.n % 16 == 0
-        epilogue_in_micro_gemm = False
+        epilogue_in_micro_gemm = self.n % 16 == 0
+        # epilogue_in_micro_gemm = False
         options = dict(
             X=X,
             W=W,
