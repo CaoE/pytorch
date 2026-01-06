@@ -1529,7 +1529,7 @@ inline void {{kernel_name}}(
     constexpr int64_t m_start = 0;
     int64_t m_end = pre_rows;
     int Nr = {{num_columns}} * 16 - N_pad;
-    {{kernel.unroll_pragma(64)}}
+    {{kernel.unroll_pragma(16)}}
     EPILOGUE_STORE_PLACEHOLDER
 {%- endif %}
 }
@@ -1537,60 +1537,6 @@ inline void {{kernel_name}}(
 
     TEMPLATE_KERNEL = r"""
 
-__attribute__((noinline, noclone))
-void compute_{{num_rows}} (
-    int k, 
-    const {{input_t}}* {{restrict_keyword}} A,
-    {%- if use_cached_dequantized_B %}
-        const {{input_t}}* {{restrict_keyword}} B,
-    {%- else %}
-        const {{input2_t}}* {{restrict_keyword}} B,
-    {%- endif %}
-    int64_t lda,
-    int64_t ldb) {
-constexpr auto horizontal_transverse = false;
-{%- set tile_offset_a = num_rows // 16 * num_columns %}
-{%- set tile_offset_b = tile_offset_a + num_rows // 16 %}
-{%- for tile_row in range(num_rows // 16) %}
-    {%- for tile_col in range(num_columns) %}
-        {%- set tile_idx_a = tile_offset_a + tile_row %}
-        {%- set tile_idx_b = tile_offset_b + tile_col %}
-        {%- set tile_idx_c = tile_row * num_columns + tile_col %}
-        {%- if tile_col == 0 %}
-        if constexpr (horizontal_transverse) {
-            _tile_loadd({{tile_idx_a}}, A + {{tile_row * 16}} * lda + k, lda * sizeof({{input_t}}));
-        } else {
-            _tile_stream_loadd({{tile_idx_a}}, A + {{tile_row * 16}} * lda + k, lda * sizeof({{input_t}}));
-        }
-        {%- endif %}
-        {%- if tile_row == 0 %}
-        if constexpr (horizontal_transverse) {
-            _tile_stream_loadd(
-                {{tile_idx_b}},
-                B + k * ldb + {{tile_col * 16 * vnni_size}},
-                ldb * {{vnni_size}} * sizeof({{input_t}})
-            );
-        } else {
-            _tile_loadd({{tile_idx_b}}, B + k * ldb + {{tile_col * 16 * vnni_size}}, ldb * {{vnni_size}} * sizeof({{input_t}}));
-        }
-        {%- endif %}
-        {%- if int8_gemm %}
-            {%- if input_dtype == torch.int8 %}
-        _tile_dpbssd({{tile_idx_c}}, {{tile_idx_a}}, {{tile_idx_b}});
-            {%- else %}
-        _tile_dpbusd({{tile_idx_c}}, {{tile_idx_a}}, {{tile_idx_b}});
-            {%- endif %}
-        {%- else %}
-            {%- if input_dtype == torch.float16 %}
-        _tile_dpfp16ps({{tile_idx_c}}, {{tile_idx_a}}, {{tile_idx_b}});
-            {%- else %}
-        _tile_dpbf16ps({{tile_idx_c}}, {{tile_idx_a}}, {{tile_idx_b}});
-            {%- endif %}
-        {%- endif %}
-    {%- endfor %}
-{%- endfor %}
-}
-    
 {%- if enable_epilogue %}
 template <bool accum, bool horizontal_transverse, bool do_epilogue, bool prefetch=false>
 {%- else %}
@@ -1659,6 +1605,49 @@ inline void {{kernel_name}}_amx_kernel_{{num_rows}}_{{num_columns}}(
         zero_c();
     }
 
+    auto compute = [&](int k) {
+{%- set tile_offset_a = num_rows // 16 * num_columns %}
+{%- set tile_offset_b = tile_offset_a + num_rows // 16 %}
+{%- for tile_row in range(num_rows // 16) %}
+    {%- for tile_col in range(num_columns) %}
+        {%- set tile_idx_a = tile_offset_a + tile_row %}
+        {%- set tile_idx_b = tile_offset_b + tile_col %}
+        {%- set tile_idx_c = tile_row * num_columns + tile_col %}
+        {%- if tile_col == 0 %}
+        if constexpr (horizontal_transverse) {
+            _tile_loadd({{tile_idx_a}}, A + {{tile_row * 16}} * lda + k, lda * sizeof({{input_t}}));
+        } else {
+            _tile_stream_loadd({{tile_idx_a}}, A + {{tile_row * 16}} * lda + k, lda * sizeof({{input_t}}));
+        }
+        {%- endif %}
+        {%- if tile_row == 0 %}
+        if constexpr (horizontal_transverse) {
+            _tile_stream_loadd(
+                {{tile_idx_b}},
+                B + k * ldb + {{tile_col * 16 * vnni_size}},
+                ldb * {{vnni_size}} * sizeof({{input_t}})
+            );
+        } else {
+            _tile_loadd({{tile_idx_b}}, B + k * ldb + {{tile_col * 16 * vnni_size}}, ldb * {{vnni_size}} * sizeof({{input_t}}));
+        }
+        {%- endif %}
+        {%- if int8_gemm %}
+            {%- if input_dtype == torch.int8 %}
+        _tile_dpbssd({{tile_idx_c}}, {{tile_idx_a}}, {{tile_idx_b}});
+            {%- else %}
+        _tile_dpbusd({{tile_idx_c}}, {{tile_idx_a}}, {{tile_idx_b}});
+            {%- endif %}
+        {%- else %}
+            {%- if input_dtype == torch.float16 %}
+        _tile_dpfp16ps({{tile_idx_c}}, {{tile_idx_a}}, {{tile_idx_b}});
+            {%- else %}
+        _tile_dpbf16ps({{tile_idx_c}}, {{tile_idx_a}}, {{tile_idx_b}});
+            {%- endif %}
+        {%- endif %}
+    {%- endfor %}
+{%- endfor %}
+    };
+
     int k = 0;
 {%- if enable_epilogue %}
     constexpr int block_k = {{block_k}};
@@ -1667,14 +1656,14 @@ inline void {{kernel_name}}_amx_kernel_{{num_rows}}_{{num_columns}}(
             int inject_period = (m_end * {{num_columns}} + (K / block_k) - 1) / (K / block_k);
             int inject = 0;
             {{kernel.unroll_pragma(num_rows)}}
-            {{epilogue_amx_avx_placeholder}}
+            EPILOGUE_AMX_EPILOGUE_PLACEHOLDER
         }
     }
 {%- endif %}
 
     {{kernel.unroll_pragma(4)}}
     for (; k < last_k_offset; k += {{block_k}}) {
-        compute_{{num_rows}}(k, A, B, lda, ldb);
+        compute(k);
     }
 
     auto store_c = [&]() {
@@ -1694,7 +1683,7 @@ inline void {{kernel_name}}_amx_kernel_{{num_rows}}_{{num_columns}}(
             amx_state.configure(tilecfg_rows, tail_k_size * sizeof({{input_t}}), {{num_rows}} / 16, {{num_columns}}, loadconfig);
             load_c();
         }
-        compute_{{num_rows}}(last_k_offset, A, B, lda, ldb);
+        compute(last_k_offset);
     }
 
     store_c();
@@ -1736,7 +1725,6 @@ inline void {{kernel_name}}_amx_kernel_{{num_rows}}_{{num_columns}}(
             "epilogue_nodes": epilogue_nodes,
             "fake_buffers": fake_buffers,
             "enable_epilogue": epilogue_nodes is not None,
-            "epilogue_amx_avx_placeholder": None,
             **extra_options,
             **self.get_common_options(),
         }
@@ -1748,7 +1736,6 @@ inline void {{kernel_name}}_amx_kernel_{{num_rows}}_{{num_columns}}(
         result = ""
         for num_rows in range(block_m, 0, -16):
             amx_kernel_options = {**options, "num_rows": num_rows}
-            amx_kernel_options["epilogue_amx_avx_placeholder"] = "EPILOGUE_AMX_EPILOGUE_PLACEHOLDER_" + str(num_rows)
             result += KernelTemplate._template_from_string(self.TEMPLATE_KERNEL).render(
                 amx_kernel_options
             )
@@ -1989,10 +1976,10 @@ inline void {{kernel_name}}_amx_kernel_{{num_rows}}_{{num_columns}}(
             return res.getvalue()
         
     
-        def amx_epilogue_store_hook(num_rows):
+        def amx_epilogue_store_hook():
             res = IndentedBuffer()
             if epilogue_store is not None:
-                epilogue_store._lines = self.epilogue_post_process(orig_lines, True, num_rows)
+                epilogue_store._lines = self.epilogue_post_process(orig_lines, True)
                 with res.indent():
                     epilogue_final_store = epilogue_store.getvalue()
                     res.writeline(epilogue_final_store)
@@ -2000,13 +1987,10 @@ inline void {{kernel_name}}_amx_kernel_{{num_rows}}_{{num_columns}}(
 
         kernel.render_hooks["EPILOGUE_CALL_PLACEHOLDER" + offsets_to_str(offsets)] = arg_hook
         kernel.render_hooks["EPILOGUE_STORE_PLACEHOLDER"] = epilogue_store_hook
-        block_m, _, _ = self.register_blocking
-        from functools import partial
-        for num_rows in range(block_m, 0, -16):
-            kernel.render_hooks["EPILOGUE_AMX_EPILOGUE_PLACEHOLDER_"+str(num_rows)] = partial(amx_epilogue_store_hook, num_rows)
+        kernel.render_hooks["EPILOGUE_AMX_EPILOGUE_PLACEHOLDER"] = amx_epilogue_store_hook
         return res.getvalue()
 
-    def epilogue_post_process(self, orig_code_lines, amx_epilogue:bool=False, num_rows:int=-1):
+    def epilogue_post_process(self, orig_code_lines, amx_epilogue:bool=False):
         import re
 
         code_lines = orig_code_lines.copy()
@@ -2081,10 +2065,10 @@ inline void {{kernel_name}}_amx_kernel_{{num_rows}}_{{num_columns}}(
             amx_lines = []
             amx_lines.append("              int do_amx = (inject == 0);")
             amx_lines.append("              inject = do_amx ? inject_period : (inject - 1);")
-            amx_lines.append("              do_amx && (compute_"+ str(num_rows) + "(k, A, B, lda, ldb), k += block_k, true);")
-            # amx_lines.append("                  compute(k);")
-            # amx_lines.append("                  k+=block_k;")
-            # amx_lines.append("              }")
+            amx_lines.append("              if (do_amx) {")
+            amx_lines.append("                  compute(k);")
+            amx_lines.append("                  k+=block_k;")
+            amx_lines.append("              }")
             return for_liners_start + amx_lines + inner_lines + for_liners_end
 
         new_code_lines = for_liners_start + inner_lines + for_liners_end
