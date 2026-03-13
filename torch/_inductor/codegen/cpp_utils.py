@@ -303,11 +303,13 @@ class LocalizeBufferHandler(V.WrapperHandler):  # type: ignore[name-defined]
         global_to_local: dict[str, ir.Buffer],
         inner_layouts: Optional[dict[str, ir.FixedLayout]],
         rewrite_index: Callable[["LocalizeBufferHandler", sympy.Expr, str], sympy.Expr],
+        in_microgemm: bool=False,
     ) -> None:
         super().__init__(inner)
         self.global_to_local = global_to_local
         self.inner_layouts = inner_layouts
         self.rewrite_index = rewrite_index
+        self.in_microgemm = in_microgemm
 
     def localize(self, name: str, index: sympy.Expr):
         # Rewrite index if either:
@@ -318,6 +320,8 @@ class LocalizeBufferHandler(V.WrapperHandler):  # type: ignore[name-defined]
         ):
             assert self.rewrite_index is not None
             index = self.rewrite_index(self, index, name)
+            # print("localize name: ", name)
+            # index = index if (self.in_microgemm and name != "local_acc_buf") else self.rewrite_index(self, index, name)
 
         if self.global_to_local and name in self.global_to_local:
             name = self.global_to_local[name].get_name()
@@ -453,6 +457,7 @@ class LocalBufferContext:
                     global_to_local=self.global_to_local,
                     inner_layouts=self.inner_layouts,
                     rewrite_index=rewrite_index,
+                    in_microgemm=self.in_microgemm,
                 )
             ):
                 return fn(*args, **kwargs)

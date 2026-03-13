@@ -9,6 +9,7 @@ from enum import Enum
 from typing import Any, Optional
 
 import torch
+import sympy
 
 from .. import cpp_builder, ir
 from ..cpu_vec_isa import (
@@ -1241,7 +1242,9 @@ MICROGEMM_EPILOGUE_DECL_ARGS
     int64_t lda,
     int64_t ldb,
     int64_t ldc,
-    int64_t ldy
+    int64_t ldy,
+    int64_t m_start,
+    int64_t n_start
 )
 """
 
@@ -1320,9 +1323,9 @@ MICROGEMM_EPILOGUE_DECL_ARGS
 {%- endif %}
 {%- if enable_epilogue %}
     {{output_t}}* C_pre=nullptr;
-    {{store_t}}* Y_pre=nullptr;
-MICROGEMM_EPILOGUE_DECLARE_PRE_PTRS
     int64_t pre_rows=0;
+    int64_t m_start_pre=m_start;
+    int64_t n_start_pre=n_start;
 {%- endif %}
     // TODO(jgong5): loop unroll for M and N
     for (int64_t n = 0; n < N; n += {{block_n}}) {
@@ -1358,7 +1361,7 @@ MICROGEMM_EPILOGUE_DECLARE_PRE_PTRS
                     C + m * ldc + n,
 {%- if enable_epilogue %}
                     C_pre,
-                    Y_pre,
+                    Y,
                     N_epi,
 MICROGEMM_EPILOGUE_CALL_PRE_ARGS
 {%- endif %}
@@ -1369,6 +1372,8 @@ MICROGEMM_EPILOGUE_CALL_PRE_ARGS
 {%- if enable_epilogue %}
                     ldy,
                     pre_rows,
+                    m_start_pre,
+                    n_start_pre,
 {%- endif %}
                     16
                 );
@@ -1376,9 +1381,9 @@ MICROGEMM_EPILOGUE_CALL_PRE_ARGS
                 m_tail += {{num_rows}};
 {%- if enable_epilogue %}
                 C_pre = C + m * ldc + n;
-                Y_pre = Y + m * ldy + n;
-MICROGEMM_EPILOGUE_UPDATE_PRE_PTRS_MAIN
                 pre_rows={{num_rows}};
+                m_start_pre = m_start + m;
+                n_start_pre = n_start + n;
 {%- endif %}
             }
 {%- endfor %}
@@ -1400,7 +1405,7 @@ MICROGEMM_EPILOGUE_UPDATE_PRE_PTRS_MAIN
                     C + m_tail * ldc + n,
 {%- if enable_epilogue %}
                     C_pre,
-                    Y_pre,
+                    Y,
                     N_epi,
 MICROGEMM_EPILOGUE_CALL_PRE_ARGS
 {%- endif %}
@@ -1411,14 +1416,16 @@ MICROGEMM_EPILOGUE_CALL_PRE_ARGS
 {%- if enable_epilogue %}
                     ldy,
                     pre_rows,
+                    m_start_pre,
+                    n_start_pre,
 {%- endif %}
                     block_m
                 );
 {%- if enable_epilogue %}
                 C_pre = C + m_tail * ldc + n;
-                Y_pre = Y + m_tail * ldy + n;
-MICROGEMM_EPILOGUE_UPDATE_PRE_PTRS_TAIL
                 pre_rows=block_m;
+                m_start_pre = m_start + m_tail;
+                n_start_pre = n_start + n;
 {%- endif %}
             }
         }
@@ -1426,10 +1433,11 @@ MICROGEMM_EPILOGUE_UPDATE_PRE_PTRS_TAIL
 
  // compute remaining epilogue
 {%- if enable_epilogue %}
-    constexpr int64_t m_start = 0;
-    int64_t m_end = pre_rows;
-    int Nr = N_epi;
-    if C10_LIKELY (Nr == 16 || Nr == 32) {
+    m_start = m_start_pre;
+    int64_t m_end = m_start + pre_rows;
+    n_start = n_start_pre;
+    int64_t n_end = n_start + N_epi;
+    if C10_LIKELY (N_epi == 16 || N_epi == 32) {
         {{kernel.unroll_pragma(16)}}
 MICROGEMM_EPILOGUE_STORE_MAIN
     } else {
@@ -1468,6 +1476,8 @@ MICROGEMM_EPILOGUE_DECL_ARGS
 {%- if enable_epilogue %}
     int64_t ldy,
     int64_t pre_rows,
+    int64_t m_start,
+    int64_t n_start,
 {%- endif %}
     uint8_t tilecfg_rows
 ) {
@@ -1478,9 +1488,8 @@ MICROGEMM_EPILOGUE_DECL_ARGS
     const auto tail_k_size = K - last_k_offset;
 {%- if enable_epilogue %}
     // init epilogue loop indexes
-    constexpr int m_start = 0;
-    int m_end = pre_rows;
-    int Nr = N_epi;
+    int64_t m_end = m_start + pre_rows;
+    int64_t n_end = n_start + N_epi;
 {%- endif %}
     if C10_LIKELY (last_k_offset > 0) {
         amx_state.configure(tilecfg_rows, 64, {{num_rows}} / 16, {{num_columns}}, loadconfig);
@@ -1545,11 +1554,11 @@ MICROGEMM_EPILOGUE_DECL_ARGS
 {%- if enable_epilogue %}
     constexpr int block_k = {{block_k}};
     if constexpr (do_epilogue) {
-        if(C_pre != nullptr && Y != nullptr) {
+        if(C_pre != nullptr && pre_rows != 0) {
             int num_k_blocks = last_k_offset / block_k;
             int inject_period = (num_k_blocks > 0) ? ((m_end * {{num_columns}} + num_k_blocks - 1) / num_k_blocks) : 1;
             int inject = 0;
-            if C10_LIKELY (Nr == 16 || Nr == 32) {
+            if C10_LIKELY (N_epi == 16 || N_epi == 32) {
                 {{kernel.unroll_pragma(num_rows)}}
 MICROGEMM_EPILOGUE_AMX_INJECT_MAIN
             } else {
@@ -1653,39 +1662,55 @@ MICROGEMM_EPILOGUE_AMX_INJECT_TAIL
 
                 return res.getvalue().rstrip("\n")
 
-            def update_pre_ptrs_main_hook():
-                res = IndentedBuffer(initial_indent=4)
-                for input_name in get_kernel_input_names(epilogue_nodes):
-                    if input_name in V.graph.removed_buffers:
-                        continue
-                    arg_name = kernel.args.input(input_name)
-                    arg = V.graph.get_buffer(input_name)
-                    if len(arg.get_size()) == 1:
-                        res.writeline(f"{arg_name}_pre = {arg_name} + {arg.get_stride()[0]} * n;")
-                    else:
-                        arg = ir.TensorBox.create(arg)
-                        arg = view(arg, [-1, arg.get_size()[-1]])
-                        assert len(arg.get_size()) == 2
-                        res.writeline(f"{arg_name}_pre = {arg_name}+ {arg.get_stride()[0]} * m + {arg.get_stride()[1]} * n;")
+            # def update_pre_ptrs_main_hook():
+            #     res = IndentedBuffer(initial_indent=4)
+            #     for input_name in get_kernel_input_names(epilogue_nodes):
+            #         if input_name in V.graph.removed_buffers:
+            #             continue
+            #         arg_name = kernel.args.input(input_name)
+            #         arg = V.graph.get_buffer(input_name)
+            #         sizes = arg.get_size()
+            #         strides = arg.get_stride()
+            #         stride_m, stride_n = 0, 1
+            #         if len(sizes) == 1:
+            #             res.writeline(f"{arg_name}_pre = {arg_name} + {strides[0]} * n;")
+            #         else:
+            #             has_stride_1 = False
+            #             for s, st in zip(sizes, strides):
+            #                 if st == 1:
+            #                     stride_m = s
+            #                     stride_n = st
+            #                     has_stride_1 = True
+            #                     break
+            #             assert has_stride_1, f"Expected at least one stride to be 1 for {input_name}, but got strides: {strides}"
+            #             res.writeline(f"{arg_name}_pre = {arg_name} + {stride_m} * m + {stride_n} * n;")
 
-                return res.getvalue().rstrip("\n")
+            #     return res.getvalue().rstrip("\n")
 
-            def update_pre_ptrs_tail_hook():
-                res = IndentedBuffer(initial_indent=4)
-                for input_name in get_kernel_input_names(epilogue_nodes):
-                    if input_name in V.graph.removed_buffers:
-                        continue
-                    arg_name = kernel.args.input(input_name)
-                    arg = V.graph.get_buffer(input_name)
-                    if len(arg.get_size()) == 1:
-                        res.writeline(f"{arg_name}_pre = {arg_name} + {arg.get_stride()[0]} * n;")
-                    else:
-                        arg = ir.TensorBox.create(arg)
-                        arg = view(arg, [-1, arg.get_size()[-1]])
-                        assert len(arg.get_size()) == 2
-                        res.writeline(f"{arg_name}_pre = {arg_name}+ {arg.get_stride()[0]} * m_tail + {arg.get_stride()[1]} * n;")
+            # def update_pre_ptrs_tail_hook():
+            #     res = IndentedBuffer(initial_indent=4)
+            #     for input_name in get_kernel_input_names(epilogue_nodes):
+            #         if input_name in V.graph.removed_buffers:
+            #             continue
+            #         arg_name = kernel.args.input(input_name)
+            #         arg = V.graph.get_buffer(input_name)
+            #         sizes = arg.get_size()
+            #         strides = arg.get_stride()
+            #         stride_m, stride_n = 0, 1
+            #         if len(sizes) == 1:
+            #             res.writeline(f"{arg_name}_pre = {arg_name} + {strides[0]} * n;")
+            #         else:
+            #             has_stride_1 = False
+            #             for s, st in zip(sizes, strides):
+            #                 if st == 1:
+            #                     stride_m = s
+            #                     stride_n = st
+            #                     has_stride_1 = True
+            #                     break
+            #             assert has_stride_1, f"Expected at least one stride to be 1 for {input_name}, but got strides: {strides}"
+            #             res.writeline(f"{arg_name}_pre = {arg_name} + {stride_m} * m_tail + {stride_n} * n;")
 
-                return res.getvalue().rstrip("\n")
+            #     return res.getvalue().rstrip("\n")
 
             def pre_args_hook():
                 res = IndentedBuffer(initial_indent=5)
@@ -1693,49 +1718,42 @@ MICROGEMM_EPILOGUE_AMX_INJECT_TAIL
                     if input_name in V.graph.removed_buffers:
                         continue
                     arg_name = kernel.args.input(input_name)
-                    arg = V.graph.get_buffer(input_name)
-                    if len(arg.get_size()) == 1:
-                        res.writeline(f"{arg_name}_pre,")
-                    else:
-                        arg = ir.TensorBox.create(arg)
-                        arg = view(arg, [-1, arg.get_size()[-1]])
-                        assert len(arg.get_size()) == 2
-                        res.writeline(f"{arg_name}_pre,")
+                    res.writeline(f"{arg_name},")
 
                 return res.getvalue().rstrip("\n")
 
-            def declare_pre_ptrs_hook():
-                assert epilogue_nodes is not None
-                res = IndentedBuffer(initial_indent=1)
-                for input_name in get_kernel_input_names(epilogue_nodes):
-                    if input_name in V.graph.removed_buffers:
-                        continue
-                    arg_name = kernel.args.input(input_name)
-                    arg = V.graph.get_buffer(input_name)
-                    res.writeline(f"const {DTYPE_TO_CPP[arg.get_dtype()]}* {arg_name}_pre = nullptr;")
-                return res.getvalue().rstrip("\n")
+            # def declare_pre_ptrs_hook():
+            #     assert epilogue_nodes is not None
+            #     res = IndentedBuffer(initial_indent=1)
+            #     for input_name in get_kernel_input_names(epilogue_nodes):
+            #         if input_name in V.graph.removed_buffers:
+            #             continue
+            #         arg_name = kernel.args.input(input_name)
+            #         arg = V.graph.get_buffer(input_name)
+            #         res.writeline(f"const {DTYPE_TO_CPP[arg.get_dtype()]}* {arg_name}_pre = nullptr;")
+            #     return res.getvalue().rstrip("\n")
 
             def epilogue_store_hook(parallel_amx_avx:bool = False, is_main:bool = False):
                 assert epilogue_store is not None
                 res = self.epilogue_post_process(epilogue_store, parallel_amx_avx, is_main)
 
-                if not parallel_amx_avx:
-                    for i, line in enumerate(res._lines):
-                        for input_name in get_kernel_input_names(epilogue_nodes):
-                            if input_name in V.graph.removed_buffers:
-                                continue
-                            arg_name = kernel.args.input(input_name)
-                            if arg_name in line:
-                                res._lines[i] = line.replace(arg_name, f"{arg_name}_pre")
+                # if not parallel_amx_avx:
+                #     for i, line in enumerate(res._lines):
+                #         for input_name in get_kernel_input_names(epilogue_nodes):
+                #             if input_name in V.graph.removed_buffers:
+                #                 continue
+                #             arg_name = kernel.args.input(input_name)
+                #             if arg_name in line:
+                #                 res._lines[i] = line.replace(arg_name, f"{arg_name}_pre")
 
 
                 return res.getvalue()
 
             kernel.render_hooks["MICROGEMM_EPILOGUE_DECL_ARGS"] = declare_kernel_hook
-            kernel.render_hooks["MICROGEMM_EPILOGUE_UPDATE_PRE_PTRS_MAIN"] = update_pre_ptrs_main_hook
-            kernel.render_hooks["MICROGEMM_EPILOGUE_UPDATE_PRE_PTRS_TAIL"] = update_pre_ptrs_tail_hook
+            # kernel.render_hooks["MICROGEMM_EPILOGUE_UPDATE_PRE_PTRS_MAIN"] = update_pre_ptrs_main_hook
+            # kernel.render_hooks["MICROGEMM_EPILOGUE_UPDATE_PRE_PTRS_TAIL"] = update_pre_ptrs_tail_hook
             kernel.render_hooks["MICROGEMM_EPILOGUE_CALL_PRE_ARGS"] = pre_args_hook
-            kernel.render_hooks["MICROGEMM_EPILOGUE_DECLARE_PRE_PTRS"] = declare_pre_ptrs_hook
+            # kernel.render_hooks["MICROGEMM_EPILOGUE_DECLARE_PRE_PTRS"] = declare_pre_ptrs_hook
 
             kernel.render_hooks["MICROGEMM_EPILOGUE_STORE_TAIL"] = epilogue_store_hook
             kernel.render_hooks["MICROGEMM_EPILOGUE_STORE_MAIN"] = functools.partial(epilogue_store_hook, is_main=True)
@@ -1805,6 +1823,8 @@ MICROGEMM_EPILOGUE_AMX_INJECT_TAIL
             )
 
         assert Y is not None, "AMX epilogue requires Y"
+        if offsets is None:
+            offsets = ("0", "0")
         assert offsets is not None and len(offsets) == 2, "AMX epilogue requires 2D offsets"
 
         A_ptr = f"&({kernel.index(A, [0, 0])})"
@@ -1846,7 +1866,10 @@ MICROGEMM_EPILOGUE_AMX_INJECT_TAIL
             res.writeline(f"{lda},")
             res.writeline(f"{ldb},")
             res.writeline(f"{ldc},")
-            res.writeline(f"{ldy}")
+            res.writeline(f"{ldy},")
+            res.writeline("m_start,")
+            res.writeline("Nr*nci")
+
         res.writeline(");")
 
         def arg_hook():
@@ -1868,14 +1891,35 @@ MICROGEMM_EPILOGUE_AMX_INJECT_TAIL
                 if arg is None:
                     continue
 
-                if len(arg.get_size()) == 2:
+                sizes = arg.get_size()
+                strides = arg.get_stride()
+                if len(sizes) == 2:
                     arg_ptr = f"&({kernel.index(arg, [offsets[0], offsets[1]])})"  # type: ignore[arg-type]
-                elif len(arg.get_size()) == 1:
+                elif len(sizes) == 1:
                     arg_ptr = f"&({kernel.index(arg, [offsets[1]])})"  # type: ignore[arg-type]
                 else:
-                    arg_tb = ir.TensorBox.create(arg)
-                    arg_tb = view(arg_tb, [-1, arg.get_size()[-1]])
-                    arg_ptr = f"&({kernel.index(arg_tb, [offsets[0], offsets[1]])})"  # type: ignore[arg-type]
+                    contig_dim = -1
+                    for i, st in enumerate(strides):
+                        if st == 1:
+                            contig_dim = i
+                            break
+                    assert contig_dim != -1, f"Expected at least one stride to be 1 for {input_name}, got {strides}"
+
+                    size_n = sizes[contig_dim]
+                    size_m = sympy.Integer(1)
+                    for i, s in enumerate(sizes):
+                        if i != contig_dim:
+                            size_m = size_m * s
+
+                    new_layout = ir.FixedLayout(
+                        arg.get_device(),
+                        arg.get_dtype(),
+                        [size_m, size_n],
+                        [size_n, sympy.Integer(1)],
+                        getattr(arg.get_layout(), "offset", sympy.Integer(0)),
+                    )
+                    dummy_buf = ir.Buffer(name=arg.get_name(), layout=new_layout)
+                    arg_ptr = f"&({kernel.index(dummy_buf, [offsets[0], offsets[1]])})"  # type: ignore[arg-type]
 
                 hook_res.writeline(f"{arg_ptr},")
 
@@ -1899,9 +1943,11 @@ MICROGEMM_EPILOGUE_AMX_INJECT_TAIL
             for i, line in enumerate(res._lines):
                 line = (line if isinstance(line, str) else line.line)
                 if "MICROGEMM_EPILOGUE_DST_BUF" in line:
-                    line = line.replace("MICROGEMM_EPILOGUE_DST_BUF", "Y" if amx_epilogue else "Y_pre")
-                if "store(Y" in line and "store(Y_pre" not in line and not amx_epilogue:
-                    line = line.replace("store(Y", "store(Y_pre")
+                    # line = line.replace("MICROGEMM_EPILOGUE_DST_BUF", "Y" if amx_epilogue else "Y_pre")
+                    line = line.replace("MICROGEMM_EPILOGUE_DST_BUF", "Y")
+                # if "store(Y" in line and "store(Y_pre" not in line and not amx_epilogue:
+                # if "store(Y" in line and "store(Y_pre" not in line:
+                #     line = line.replace("store(Y", "store(Y_pre")
                 if "MICROGEMM_EPILOGUE_ACC_BUF" in line:
                     line = line.replace("MICROGEMM_EPILOGUE_ACC_BUF", "C_pre")
                 if "microgemm_epilogue_dst_ld" in line:

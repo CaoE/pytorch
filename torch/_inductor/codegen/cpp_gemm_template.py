@@ -7,6 +7,7 @@ from functools import lru_cache
 from typing import Any, cast, Optional, TypeVar, Union
 from unittest.mock import patch
 
+import sympy
 import torch
 import torch.utils
 from torch.utils._ordered_set import OrderedSet
@@ -177,8 +178,8 @@ GEMM_TEMPLATE_MICROKERNEL_DEF = r"""
 {%- if fuse_epilogue_into_microkernel %}
 {{ kernel.define_buffer("local_acc_buf", ["Mc_blocks*Mr", "Nc_blocks*Nr"], acc_buf_dtype, alloc=False) }}
 {%- set acc = kernel.local_buffers["local_acc_buf"] %}
-{%- set acc_slice = kernel.slice_nd(acc, [("0", "m_end - m_start"), ("(nci - nc)*Nr", "(nci - nc + 1)*Nr")]) %}
-{%- set tile_Y = kernel.slice_nd(Y_2d, [("m_start", "m_end"), ("nci*Nr", "(nci+1)*Nr")]) %}
+{%- set tile_Y = kernel.slice_nd(Y_2d, [("m_start", "m_end"), ("n_start", "n_end")]) %}
+{%- set acc_slice = kernel.slice_nd(acc, [("0", "m_end - m_start"), ("0", "n_end - n_start")]) %}
 {{micro_gemm.codegen_define(
     kernel,
     fake_buffers,
@@ -187,6 +188,7 @@ GEMM_TEMPLATE_MICROKERNEL_DEF = r"""
                         acc_slice,
                         GemmOut,
                         epilogue_nodes,
+                        offsets=("m_start", "n_start"),
                         reindexers=reindexers,
                         in_microgemm=True))}}
 {%- else %}
@@ -267,7 +269,7 @@ GEMM_TEMPLATE = r"""
 {%- endif %}
                     {% if fuse_epilogue_into_microkernel %}
                         int64_t N_epi = N - nci * Nr < Nr ? (N - nci * Nr) : Nr;
-                        {%- set tile_Y = kernel.slice_nd(Y_2d, [("m_start", "m_end"), ("nci*Nr", "(nci+1)*Nr")]) %}
+                        {%- set tile_Y = Y_2d %}
                         if (kc == k_block_start && kc + Kc_blocks < k_block_end) {
                             {{ micro_gemm.codegen_call(kernel,
                                                        tile_X,
@@ -277,7 +279,6 @@ GEMM_TEMPLATE = r"""
                                                        Y=tile_Y,
                                                        do_epilogue=False,
                                                        epilogue_nodes=epilogue_nodes,
-                                                       offsets=("m_start", "nci*Nr"),
                                                        qscale_and_zeros=tile_qparam)|indent(28, false)
                             }}
                         } else if (kc == k_block_start && kc + Kc_blocks >= k_block_end) {
@@ -289,7 +290,6 @@ GEMM_TEMPLATE = r"""
                                                        Y=tile_Y,
                                                        do_epilogue=True,
                                                        epilogue_nodes=epilogue_nodes,
-                                                       offsets=("m_start", "nci*Nr"),
                                                        qscale_and_zeros=tile_qparam)|indent(28, false)
                             }}
                         } else if (kc >= k_block_end - Kc_blocks) {
@@ -301,7 +301,6 @@ GEMM_TEMPLATE = r"""
                                                        Y=tile_Y,
                                                        do_epilogue=True,
                                                        epilogue_nodes=epilogue_nodes,
-                                                       offsets=("m_start", "nci*Nr"),
                                                        qscale_and_zeros=tile_qparam)|indent(28, false)
                             }}
                         } else {
@@ -313,7 +312,6 @@ GEMM_TEMPLATE = r"""
                                                        Y=tile_Y,
                                                        do_epilogue=False,
                                                        epilogue_nodes=epilogue_nodes,
-                                                       offsets=("m_start", "nci*Nr"),
                                                        qscale_and_zeros=tile_qparam)|indent(28, false)
                             }}
                         }
@@ -1648,12 +1646,204 @@ class CppGemmTemplate(CppTemplate):
                 output_names.add(node.get_name())
 
         # Check if we have any output that is NOT Y (or an alias of Y)
+        # TODO allow more cases
         y_name = Y.get_name()
         has_other_outputs = False
         for name in output_names:
             if name != y_name and name not in Y_aliases:
                 has_other_outputs = True
                 break
+
+        # # Determine whether epilogue indexing is compatible with micro-gemm in-kernel epilogue.
+        # # We can only fuse when epilogue outputs are elementwise-aligned with GEMM's 2D (M,N)
+        # # indexing using only (m,n) offsets; i.e. allow identical layout or reshape-only views.
+        # gemm_out_size = template_buffer.get_size()
+        # gemm_out_numel = template_buffer.get_numel()
+        # gemm_out_stride = template_buffer.get_stride()
+        # gemm_M, gemm_N = gemm_out_size
+
+        # def _sym_eq(a: Any, b: Any) -> bool:
+        #     try:
+        #         return sympy.simplify(sympy.sympify(a) - sympy.sympify(b)) == 0
+        #     except Exception:
+        #         return False
+
+        # def _sym_prod(vals: list[Any]) -> Any:
+        #     out = sympy.Integer(1)
+        #     for v in vals:
+        #         out *= sympy.sympify(v)
+        #     return sympy.simplify(out)
+
+        # def _is_identity_reindexer(
+        #     reindexer: Optional[Callable[[list[Any]], list[Any]]], ndims: int
+        # ) -> bool:
+        #     if reindexer is None:
+        #         return True
+        #     try:
+        #         syms = sympy.symbols(f"i0:{ndims}", integer=True, nonnegative=True)
+        #         idx = [syms] if ndims == 1 else list(syms)
+        #         out = reindexer(idx)
+        #         if len(out) != ndims:
+        #             return False
+        #         return all(_sym_eq(o, i) for o, i in zip(out, idx))
+        #     except Exception:
+        #         return False
+
+        # def _reindexer_well_formed_for_mn(
+        #     reindexer: Optional[Callable[[list[Any]], list[Any]]], out_ndims: int
+        # ) -> bool:
+        #     if reindexer is None:
+        #         return False
+        #     try:
+        #         m, n = sympy.symbols("m n", integer=True, nonnegative=True)
+        #         out = reindexer([m, n])
+        #         if len(out) != out_ndims:
+        #             return False
+        #         allowed = {m, n}
+        #         for x in out:
+        #             sx = sympy.sympify(x)
+        #             if not sx.free_symbols.issubset(allowed):
+        #                 return False
+        #         return True
+        #     except Exception:
+        #         return False
+
+        # def _dense_sizes_in_stride_decreasing_order(
+        #     node: ir.IRNode,
+        # ) -> Optional[list[Any]]:
+        #     """
+        #     Return sizes reordered by stride decreasing order if the layout is
+        #     dense-permutation contiguous (allows channels-last-like permutations).
+        #     Otherwise return None.
+        #     """
+        #     if not hasattr(node, "get_size") or not hasattr(node, "get_stride"):
+        #         return None
+
+        #     size = list(node.get_size())
+        #     stride = list(node.get_stride())
+        #     try:
+        #         stride_order = list(
+        #             ir.get_stride_order(V.graph.sizevars.size_hints(stride))
+        #         )
+        #         fill_order = ir.stride_order2fill_order(stride_order)
+        #         order = list(reversed(fill_order))
+        #     except Exception:
+        #         return None
+
+        #     ordered_sizes = [size[i] for i in order]
+        #     expected = list(ir.FlexibleLayout.contiguous_strides(ordered_sizes))
+        #     for pos, dim in enumerate(order):
+        #         sz = size[dim]
+        #         st = stride[dim]
+        #         if _sym_eq(sz, 1):
+        #             continue
+        #         if _sym_eq(st, 0):
+        #             return None
+        #         if not _sym_eq(st, expected[pos]):
+        #             return None
+        #     return ordered_sizes
+
+        # def _mn_partitionable_from_dense_order(node: ir.IRNode) -> bool:
+        #     """
+        #     Check if dense stride-ordered dimensions can be split into products
+        #     equal to GEMM (M, N), preserving linear element order.
+        #     """
+        #     ordered_sizes = _dense_sizes_in_stride_decreasing_order(node)
+        #     if ordered_sizes is None:
+        #         return False
+
+        #     for cut in range(len(ordered_sizes) + 1):
+        #         m_part = _sym_prod(ordered_sizes[:cut])
+        #         n_part = _sym_prod(ordered_sizes[cut:])
+        #         if _sym_eq(m_part, gemm_M) and _sym_eq(n_part, gemm_N):
+        #             return True
+        #     return False
+
+        # def _bias_is_n_only_indexable_for_microgemm(
+        #     bias: Union[ir.IRNode, torch.Tensor], n_dim: Any
+        # ) -> bool:
+        #     """
+        #     Allow bias forms that can be addressed by n only in micro-gemm epilogue:
+        #       1) scalar (numel == 1)
+        #       2) 1D [N] with stride[-1] == 1
+        #       3) ND [..., N] with broadcast-only leading dims and dense last dim
+        #     """
+        #     if isinstance(bias, torch.Tensor):
+        #         if bias.numel() == 1 or bias.dim() == 0:
+        #             return True
+        #         if has_free_symbols((n_dim,)):
+        #             return False
+        #         if bias.shape[-1] != int(n_dim):
+        #             return False
+        #         st = bias.stride()
+        #         if st[-1] != 1:
+        #             return False
+        #         for sz, s in zip(bias.shape[:-1], st[:-1]):
+        #             if sz != 1 and s != 0:
+        #                 return False
+        #         return True
+
+        #     if bias.get_numel() == 1:
+        #         return True
+        #     if not hasattr(bias, "get_size") or not hasattr(bias, "get_stride"):
+        #         return False
+        #     bsz = list(bias.get_size())
+        #     bst = list(bias.get_stride())
+        #     if len(bsz) == 0:
+        #         return True
+        #     if not _sym_eq(bsz[-1], n_dim):
+        #         return False
+        #     if not _sym_eq(bst[-1], 1):
+        #         return False
+        #     for sz, st in zip(bsz[:-1], bst[:-1]):
+        #         if not (_sym_eq(sz, 1) or _sym_eq(st, 0)):
+        #             return False
+        #     return True
+
+        # def _microgemm_epilogue_mn_compatible(
+        #     node: ir.IRNode, reindexer: Optional[Callable[[list[Any]], list[Any]]]
+        # ) -> bool:
+        #     # 1) Must match element count.
+        #     if node.get_numel() != gemm_out_numel:
+        #         return False
+
+        #     same_layout = (
+        #         node.get_size() == gemm_out_size and node.get_stride() == gemm_out_stride
+        #     )
+
+        #     # 2) Exact same layout: only identity mapping is valid.
+        #     if same_layout:
+        #         return _is_identity_reindexer(reindexer, len(gemm_out_size))
+
+        #     # 3) Different layout: need a valid reindexer and dense
+        #     #    reshape/permutation equivalence to GEMM (M, N).
+        #     if not _reindexer_well_formed_for_mn(reindexer, len(node.get_size())):
+        #         return False
+        #     return _mn_partitionable_from_dense_order(node)
+
+        # # Pair epilogues and reindexers (invariant for correct store_output pairing).
+        # has_unsupported_epilogue_indexing = False
+        # if len(reindexers) != len(epilogues):
+        #     has_unsupported_epilogue_indexing = True
+        #     log.debug(
+        #         "Disable in-microgemm epilogue fusion: len(reindexers)=%d != len(epilogues)=%d",
+        #         len(reindexers),
+        #         len(epilogues),
+        #     )
+        # else:
+        #     for node, reindexer in zip(epilogues, reindexers):
+        #         assert hasattr(node, "get_size")
+        #         assert hasattr(node, "get_numel")
+        #         if not _microgemm_epilogue_mn_compatible(node, reindexer):
+        #             has_unsupported_epilogue_indexing = True
+        #             break
+
+        # bias_input_supported_in_microgemm = True
+        # if inp is not None and self.beta != 0 and not int8_gemm:
+        #     bias_input_supported_in_microgemm = (
+        #         _bias_is_n_only_indexable_for_microgemm(inp, gemm_N)
+        #     )
+
 
         fuse_epilogue_into_microkernel = (
             isinstance(micro_gemm, CppMicroGemmAMX)

@@ -139,6 +139,8 @@ class CppTemplateKernel(CppKernel):
 
     def index(self, node: ir.Buffer, indices: list[Any]) -> str:
         indexer = node.get_layout().as_fixed().make_indexer()
+        print("node.get_layout().as_fixed(): ", node.get_layout().as_fixed())
+        print("indices: ", indices)
         index = indexer(parse_expr_with_index_symbols(indices))
         index = self.rename_indexing(index)
         outer_name = node.get_name()
@@ -269,14 +271,14 @@ class CppTemplateKernel(CppKernel):
                 dtype=dst.get_dtype(),
                 size=dst.get_size(),
                 stride=[dst_s0, one],
-                offset=sympy.Integer(0),
+                offset=dst.get_layout().offset,
             ),
             src.get_name(): ir.FixedLayout(
                 device=torch.device("cpu"),
                 dtype=src.get_dtype(),
                 size=src.get_size(),
                 stride=[src_s0, one],
-                offset=sympy.Integer(0),
+                offset=src.get_layout().offset,
             ),
         }
         return name_overrides, layout_overrides
@@ -303,9 +305,13 @@ class CppTemplateKernel(CppKernel):
 
         if in_microgemm:
             assert inner_layouts is not None and dst.get_name() in inner_layouts
+            print("inner_layouts[dst.get_name()]: ", inner_layouts[dst.get_name()])
             output_index = inner_layouts[dst.get_name()].make_indexer()([*var_ranges.keys()])
+            print("in_microgemm output_index: ", output_index)
         else:
+            print("dst.get_layout(): ", dst.get_layout())
             output_index = dst.get_layout().make_indexer()([*var_ranges.keys()])
+            print("output_index: ", output_index)
         kernel_group = KernelGroup()
         kernel_group.args = self.args
         cpp_kernel_proxy = CppKernelProxy(kernel_group)
@@ -317,10 +323,12 @@ class CppTemplateKernel(CppKernel):
             assert isinstance(node, ir.Pointwise), node
 
             def fn(*args):
+                print("args: ", args)
                 assert len(args) == 2
                 assert len(args[0]) == len(var_sizes[0])
                 assert len(args[1]) == 0
                 new_args = [arg + offset for arg, offset in zip(args[0], offsets)]  # type: ignore[arg-type]
+                print("new_args: ", new_args)
                 if reindexers[i] is not None:
                     new_args = reindexers[i](new_args)  # type: ignore[misc]
                 V.ops.store(
